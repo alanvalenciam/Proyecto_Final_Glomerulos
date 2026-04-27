@@ -8,3 +8,6 @@ CLAUDE.md
 GEMINI.md
 AGENTS.md
 /__pycache__
+/docs
+/logs
+/tmp

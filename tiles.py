@@ -3,96 +3,234 @@ from PIL import Image
 import numpy as np
 from pathlib import Path
 
-# Aumentar límite de píxeles para imágenes gigantes
-Image.MAX_IMAGE_PIXELS = None 
+# Remove pixel limit for large images
+Image.MAX_IMAGE_PIXELS = None
 
-def process_folder_to_subfolders(input_dir, output_dir, tile_size=512, overlap=0, bg_threshold=0.8):
-    # Crea el directorio de salida principal si no existe
-    Path(output_dir).mkdir(parents=True, exist_ok=True)
-    
-    # Definir qué tipos de archivos vamos a procesar
-    valid_extensions = {'.tif', '.tiff', '.png', '.jpg', '.jpeg', '.svs'}
-    
-    # Obtener lista de archivos válidos en la carpeta de entrada
-    archivos = os.listdir(input_dir)
-    imagenes_a_procesar = [f for f in archivos if os.path.splitext(f)[1].lower() in valid_extensions]
-    
-    if not imagenes_a_procesar:
-        print(f"No se encontraron imágenes en: {input_dir}")
-        return
+# OpenSlide support for SVS, NDPI, VMS formats
+try:
+    import openslide
+    OPENSLIDE_AVAILABLE = True
+except ImportError:
+    OPENSLIDE_AVAILABLE = False
+    print("WARNING: openslide-python not installed.")
+    print("Install with: pip install openslide-python")
+    print("SVS, NDPI, and VMS formats will not be supported.\n")
 
-    print(f"Se encontraron {len(imagenes_a_procesar)} imágenes para procesar.\n")
-    
-    # Recorrer cada imagen de la carpeta
-    for file_name in imagenes_a_procesar:
-        image_path = os.path.join(input_dir, file_name)
-        base_name = os.path.splitext(file_name)[0] # Nombre sin la extensión
-        
-        # =========================================================
-        # NUEVO: Crear una subcarpeta específica para esta imagen
-        # =========================================================
-        image_output_dir = os.path.join(output_dir, base_name)
-        Path(image_output_dir).mkdir(parents=True, exist_ok=True)
-        
-        print(f"▶ Procesando: {file_name}")
-        print(f"  Creando subcarpeta: {image_output_dir}")
-        
-        try:
-            img = Image.open(image_path)
-            width, height = img.size
-            print(f"  Dimensiones: {width}x{height}")
-            
-            stride = tile_size - overlap
-            saved_count = 0
-            
-            # Recorrer la imagen completa
-            for y in range(0, height, stride):
-                for x in range(0, width, stride):
-                    
-                    # Definir coordenadas reales
-                    x_end = min(x + tile_size, width)
-                    y_end = min(y + tile_size, height)
-                    
-                    # Extraer el recorte
-                    tile = img.crop((x, y, x_end, y_end))
-                    
-                    # Padding (Relleno) si el tile es más pequeño que 512x512
-                    if tile.size != (tile_size, tile_size):
-                        new_tile = Image.new("RGB", (tile_size, tile_size), (255, 255, 255))
-                        new_tile.paste(tile, (0, 0))
-                        tile = new_tile
-                    
-                    # Verificar fondo para descartar tiles vacíos
-                    if not is_mostly_background(tile, bg_threshold):
-                        # Guardamos el tile DENTRO de la nueva subcarpeta (image_output_dir)
-                        tile_name = f"{base_name}_tile_x{x:05d}_y{y:05d}.png"
-                        tile_path = os.path.join(image_output_dir, tile_name)
-                        tile.save(tile_path)
-                        saved_count += 1
-                        
-                        # Mostrar progreso en la misma línea
-                        if saved_count % 100 == 0:
-                            print(f"  Guardados {saved_count} tiles...", end='\r')
+# Supported formats
+OPENSLIDE_FORMATS = {'.svs', '.ndpi', '.vms'}
+PIL_FORMATS = {'.tif', '.tiff', '.png', '.jpg', '.jpeg'}
+ALL_FORMATS = OPENSLIDE_FORMATS | PIL_FORMATS
 
-            print(f"\n  ✅ Completado. Tiles útiles: {saved_count} guardados en su carpeta.\n")
-            
-        except Exception as e:
-            print(f"\n  ❌ Error procesando {file_name}: {e}\n")
-        
-    print("🎉 ¡Proceso de toda la carpeta finalizado!")
+
+def detect_format(file_path):
+    """Detect image format by file extension."""
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext in OPENSLIDE_FORMATS:
+        return 'openslide'
+    elif ext in PIL_FORMATS:
+        return 'pil'
+    return None
+
+
+def read_openslide_image(file_path, level=0):
+    """Read SVS/NDPI/VMS file using OpenSlide at specified resolution level."""
+    if not OPENSLIDE_AVAILABLE:
+        raise RuntimeError(
+            f"OpenSlide not available. Install with: pip install openslide-python"
+        )
+
+    slide = openslide.open_slide(file_path)
+    width, height = slide.level_dimensions[level]
+    level_count = slide.level_count
+
+    # Read image at specified level
+    pil_image = slide.read_region((0, 0), level, (width, height))
+
+    # Convert to RGB
+    if pil_image.mode == 'RGBA':
+        rgb_image = Image.new('RGB', pil_image.size, (255, 255, 255))
+        rgb_image.paste(pil_image, mask=pil_image.split()[3])
+        pil_image = rgb_image
+    elif pil_image.mode != 'RGB':
+        pil_image = pil_image.convert('RGB')
+
+    return pil_image, width, height, level_count
+
+
+def read_pil_image(file_path):
+    """Read TIFF, PNG, JPEG using PIL."""
+    img = Image.open(file_path)
+
+    if img.mode == 'RGBA':
+        rgb_image = Image.new('RGB', img.size, (255, 255, 255))
+        rgb_image.paste(img, mask=img.split()[3])
+        img = rgb_image
+    elif img.mode != 'RGB':
+        img = img.convert('RGB')
+
+    return img
+
+
+def save_tile(tile, tile_path, output_format='png'):
+    """Save tile in specified format (png, jpg, tiff)."""
+    output_format = output_format.lower().strip('.')
+
+    try:
+        if output_format == 'png':
+            tile.save(tile_path, 'PNG')
+        elif output_format in ('jpg', 'jpeg'):
+            if tile.mode != 'RGB':
+                tile = tile.convert('RGB')
+            tile.save(tile_path, 'JPEG', quality=95)
+        elif output_format == 'tiff':
+            tile.save(tile_path, 'TIFF', compression='lzw')
+        else:
+            raise ValueError(f"Unsupported format: {output_format}")
+    except Exception as e:
+        if output_format == 'png':
+            print(f"    PNG save failed, falling back to JPEG")
+            tile_path = tile_path.replace('.png', '.jpg')
+            if tile.mode != 'RGB':
+                tile = tile.convert('RGB')
+            tile.save(tile_path, 'JPEG', quality=95)
+        else:
+            raise
+
 
 def is_mostly_background(tile, threshold=0.8):
+    """Check if tile is mostly white/background (grayscale > 140)."""
     gray = np.array(tile.convert('L'))
-    # 140 es el umbral para considerar un píxel como "blanco/beige claro"
-    white_pixels = np.sum(gray > 140) 
+    white_pixels = np.sum(gray > 140)
     white_ratio = white_pixels / gray.size
     return white_ratio > threshold
 
+
+def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=0,
+                                bg_threshold=0.8, output_format='png', openslide_level=0,
+                                format_filter=None):
+    """
+    Process histopathology images into tiles.
+
+    Args:
+        input_dir: Directory containing input images
+        output_dir: Directory for output tiles
+        tile_size: Size of each tile in pixels (default 1536)
+        overlap: Overlap between tiles in pixels (default 0)
+        bg_threshold: Threshold for background detection 0-1 (default 0.8)
+        output_format: Output format: 'png', 'jpg', 'tiff' (default 'png')
+        openslide_level: Resolution level for OpenSlide images (0=highest)
+        format_filter: List of formats to process (e.g. ['tiff', 'svs'])
+                      If None, process all supported formats
+    """
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+    # Determine which formats to process
+    if format_filter is None:
+        allowed_formats = ALL_FORMATS
+    else:
+        allowed_formats = {
+            ('.' + fmt.lstrip('.').lower()) if not fmt.startswith('.') else fmt.lower()
+            for fmt in format_filter
+        }
+
+    # Find images
+    archivos = os.listdir(input_dir)
+    imagenes_a_procesar = [
+        f for f in archivos
+        if os.path.splitext(f)[1].lower() in allowed_formats
+    ]
+
+    if not imagenes_a_procesar:
+        print(f"No images found in: {input_dir}")
+        return
+
+    print(f"Found {len(imagenes_a_procesar)} image(s) to process")
+    print(f"Output format: {output_format.upper()}\n")
+
+    # Process each image
+    for file_name in imagenes_a_procesar:
+        image_path = os.path.join(input_dir, file_name)
+        base_name = os.path.splitext(file_name)[0]
+        file_ext = os.path.splitext(file_name)[1].lower()
+
+        image_output_dir = os.path.join(output_dir, "Imagen", base_name)
+        Path(image_output_dir).mkdir(parents=True, exist_ok=True)
+
+        print(f"Processing: {file_name}")
+        print(f"  Type: {file_ext[1:].upper()}")
+        print(f"  Output dir: {image_output_dir}")
+
+        try:
+            handler = detect_format(image_path)
+
+            if handler == 'openslide':
+                img, width, height, level_count = read_openslide_image(
+                    image_path, level=openslide_level
+                )
+                print(f"  Dimensions (level {openslide_level}): {width}x{height}")
+                print(f"  Resolution levels: {level_count}")
+            elif handler == 'pil':
+                img = read_pil_image(image_path)
+                width, height = img.size
+                print(f"  Dimensions: {width}x{height}")
+            else:
+                raise ValueError(f"Unsupported format: {file_ext}")
+
+            stride = tile_size - overlap
+            saved_count = 0
+
+            # Extract and save tiles
+            for y in range(0, height, stride):
+                for x in range(0, width, stride):
+                    x_end = min(x + tile_size, width)
+                    y_end = min(y + tile_size, height)
+
+                    # Get actual tile size before padding
+                    actual_width = x_end - x
+                    actual_height = y_end - y
+
+                    tile = img.crop((x, y, x_end, y_end))
+
+                    # Skip background tiles
+                    if not is_mostly_background(tile, bg_threshold):
+                        ext = '.' + output_format.lstrip('.')
+                        tile_name = f"{base_name}_tile_x{x:05d}_y{y:05d}_endx{x_end:05d}_endy{y_end:05d}{ext}"
+                        tile_path = os.path.join(image_output_dir, tile_name)
+
+                        # Pad tile to fixed size (1536x1536) with white background
+                        if tile.size != (tile_size, tile_size):
+                            padded_tile = Image.new('RGB', (tile_size, tile_size), (255, 255, 255))
+                            padded_tile.paste(tile, (0, 0))
+                            tile = padded_tile
+
+                        # Save tile
+                        save_tile(tile, tile_path, output_format)
+
+                        saved_count += 1
+
+                        if saved_count % 100 == 0:
+                            print(f"  Saved {saved_count} tiles...", end='\r')
+
+            print(f"\n  Done. Saved {saved_count} tiles.\n")
+
+        except Exception as e:
+            print(f"\n  Error processing {file_name}: {e}\n")
+            import traceback
+            traceback.print_exc()
+
+    print("Complete!")
+
+
 if __name__ == "__main__":
-    # Carpeta que contiene las imágenes (los .tiff optimizados que generaste)
-    input_dir = r"D:\Anotaciones\Entradas"
-    
-    # Carpeta raíz donde se crearán todas las subcarpetas
-    output_dir = r"D:\Anotaciones\Salidas"
-    # Ejecutar la función
-    process_folder_to_subfolders(input_dir, output_dir)
+    input_dir = r"/Users/olivera/Documents/Proyecto_Final_Glomerulos/Entradas"
+    output_dir = r"/Users/olivera/Documents/Proyecto_Final_Glomerulos/Salidas"
+
+    process_folder_to_subfolders(
+        input_dir,
+        output_dir,
+        tile_size=1536,
+        overlap=256,
+        bg_threshold=0.95,
+        output_format='png',
+        openslide_level=0
+    )

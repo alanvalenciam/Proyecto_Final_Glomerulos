@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""
+Tile Reconstruction Script
+==========================
+
+Reconstructs a full image from a set of PNG tiles organized by absolute coordinates.
+
+Each tile is named following the pattern:
+  {prefix}_tile_x{x}_y{y}_endx{endx}_endy{endy}.png
+
+Where (x, y) and (endx, endy) define the absolute pixel positions in the canvas.
+
+Usage:
+  python reconstruct_tiles.py <input_folder> <output_path>
+
+Example:
+  python reconstruct_tiles.py \
+    "/path/to/Salidas/Imagen/18-139" \
+    "/path/to/tmp/18-139_layout.png"
+
+Features:
+  - Automatic canvas dimension detection from tile coordinates
+  - RGB/RGBA support (converts to RGB if needed)
+  - Progress logging and error handling
+  - No heavy dependencies (uses PIL/Pillow only)
+"""
+
+import os
+import re
+import sys
+import logging
+from pathlib import Path
+from typing import Dict, Tuple, List, Optional
+from PIL import Image
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+def parse_tile_coordinates(filename: str) -> Dict[str, int] | None:
+    """
+    Extract (x, y, endx, endy) from tile filename.
+
+    Args:
+        filename: Tile filename, e.g., "18-139_tile_x10752_y21504_endx12288_endy23040.png"
+
+    Returns:
+        Dict with keys 'x', 'y', 'endx', 'endy', or None if parsing fails.
+    """
+    match = re.search(r'x(\d+)_y(\d+)_endx(\d+)_endy(\d+)', filename)
+    if not match:
+        return None
+
+    x, y, endx, endy = map(int, match.groups())
+    return {
+        'x': x,
+        'y': y,
+        'endx': endx,
+        'endy': endy,
+        'width': endx - x,
+        'height': endy - y,
+    }
+
+
+def discover_tiles(folder: str) -> List[Tuple[str, Dict[str, int]]]:
+    """
+    Scan folder for PNG tiles and extract their coordinates.
+
+    Args:
+        folder: Path to folder containing tile PNGs
+
+    Returns:
+        List of (filename, coords_dict) tuples, sorted by (y, x)
+
+    Raises:
+        ValueError: If no PNG tiles are found in the folder
+    """
+    tiles = []
+
+    for filename in os.listdir(folder):
+        if not filename.endswith('.png'):
+            continue
+
+        coords = parse_tile_coordinates(filename)
+        if coords is None:
+            logger.warning(f"Skipping {filename}: Could not parse coordinates")
+            continue
+
+        tiles.append((filename, coords))
+
+    if not tiles:
+        raise ValueError(f"No valid PNG tiles found in {folder}")
+
+    # Sort by y, then x for logical ordering
+    tiles.sort(key=lambda t: (t[1]['y'], t[1]['x']))
+
+    logger.info(f"Found {len(tiles)} valid tiles in {folder}")
+    return tiles
+
+
+def calculate_canvas_dimensions(tiles: List[Tuple[str, Dict[str, int]]]) -> Tuple[int, int, int, int]:
+    """
+    Calculate canvas dimensions and offset from tile coordinates.
+
+    Args:
+        tiles: List of (filename, coords_dict) tuples
+
+    Returns:
+        Tuple of (canvas_width, canvas_height, min_x, min_y)
+    """
+    min_x = min(t[1]['x'] for t in tiles)
+    max_x = max(t[1]['endx'] for t in tiles)
+    min_y = min(t[1]['y'] for t in tiles)
+    max_y = max(t[1]['endy'] for t in tiles)
+
+    canvas_width = max_x - min_x
+    canvas_height = max_y - min_y
+
+    logger.info(f"Canvas dimensions: {canvas_width}x{canvas_height}")
+    logger.info(f"X range: {min_x} to {max_x}")
+    logger.info(f"Y range: {min_y} to {max_y}")
+
+    return canvas_width, canvas_height, min_x, min_y
+
+
+def reconstruct_image(
+    folder: str,
+    output_path: str,
+    verbose: bool = True
+) -> None:
+    """
+    Reconstruct full image from tiles.
+
+    Args:
+        folder: Path to folder containing tile PNGs
+        output_path: Path where reconstructed image will be saved
+        verbose: Print progress information
+
+    Raises:
+        FileNotFoundError: If folder does not exist
+        ValueError: If no valid tiles are found
+        IOError: If image cannot be saved
+    """
+    folder = os.path.abspath(folder)
+    output_path = os.path.abspath(output_path)
+
+    # Validate input
+    if not os.path.isdir(folder):
+        raise FileNotFoundError(f"Folder not found: {folder}")
+
+    # Create output directory if needed
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Created output directory: {output_dir}")
+
+    # Discover and parse tiles
+    tiles = discover_tiles(folder)
+    canvas_w, canvas_h, min_x, min_y = calculate_canvas_dimensions(tiles)
+
+    # Create blank canvas (white background, RGB)
+    logger.info(f"Creating canvas {canvas_w}x{canvas_h}...")
+    canvas = Image.new('RGB', (canvas_w, canvas_h), color='white')
+
+    # Paste each tile onto canvas
+    logger.info("Pasting tiles onto canvas...")
+    for i, (filename, coords) in enumerate(tiles, 1):
+        tile_path = os.path.join(folder, filename)
+
+        try:
+            tile_img = Image.open(tile_path)
+
+            # Convert RGBA to RGB if needed
+            if tile_img.mode == 'RGBA':
+                tile_img = tile_img.convert('RGB')
+            elif tile_img.mode != 'RGB':
+                tile_img = tile_img.convert('RGB')
+
+            paste_x = coords['x'] - min_x
+            paste_y = coords['y'] - min_y
+
+            # Crop tile to actual content area (remove padding)
+            actual_width = coords['width']
+            actual_height = coords['height']
+            if tile_img.size[0] > actual_width or tile_img.size[1] > actual_height:
+                tile_img = tile_img.crop((0, 0, actual_width, actual_height))
+
+            # Paste tile
+            canvas.paste(tile_img, (paste_x, paste_y))
+
+            if verbose and i % 5 == 0:
+                logger.info(f"  Processed {i}/{len(tiles)} tiles...")
+
+        except Exception as e:
+            logger.error(f"Error processing {filename}: {e}")
+            raise
+
+    # Save result
+    logger.info(f"Saving reconstructed image to {output_path}...")
+    canvas.save(output_path, 'PNG', quality=95)
+    logger.info(f"Success! Image saved to {output_path}")
+    logger.info(f"Final image size: {canvas.size}")
+
+
+def batch_reconstruct(parent_folder: str, output_folder: str) -> None:
+    """
+    Recursively reconstruct all images from tile subfolders.
+
+    Args:
+        parent_folder: Path to parent folder containing case subfolders
+        output_folder: Path where all reconstructed images will be saved
+    """
+    parent_folder = os.path.abspath(parent_folder)
+    output_folder = os.path.abspath(output_folder)
+
+    if not os.path.isdir(parent_folder):
+        raise FileNotFoundError(f"Parent folder not found: {parent_folder}")
+
+    os.makedirs(output_folder, exist_ok=True)
+    logger.info(f"Processing all cases from: {parent_folder}")
+    logger.info(f"Output folder: {output_folder}")
+
+    # Collect all subfolders
+    subfolders = [
+        d for d in os.listdir(parent_folder)
+        if os.path.isdir(os.path.join(parent_folder, d)) and not d.startswith('.')
+    ]
+    subfolders.sort()
+
+    logger.info(f"Found {len(subfolders)} cases to process")
+
+    results = {'success': 0, 'failed': 0, 'skipped': 0}
+
+    for i, case_name in enumerate(subfolders, 1):
+        case_path = os.path.join(parent_folder, case_name)
+        output_path = os.path.join(output_folder, f"{case_name}_reconstructed.png")
+
+        # Check if folder has PNG tiles
+        has_tiles = any(f.endswith('.png') for f in os.listdir(case_path))
+        if not has_tiles:
+            logger.warning(f"[{i}/{len(subfolders)}] SKIPPED {case_name}: No PNG tiles found")
+            results['skipped'] += 1
+            continue
+
+        try:
+            logger.info(f"[{i}/{len(subfolders)}] Processing {case_name}...")
+            reconstruct_image(case_path, output_path, verbose=False)
+            results['success'] += 1
+            logger.info(f"  ✓ {case_name} reconstructed successfully")
+        except Exception as e:
+            results['failed'] += 1
+            logger.error(f"  ✗ {case_name} failed: {e}")
+
+    # Summary
+    logger.info("="*60)
+    logger.info("RECONSTRUCTION SUMMARY")
+    logger.info(f"  Success: {results['success']}")
+    logger.info(f"  Failed: {results['failed']}")
+    logger.info(f"  Skipped: {results['skipped']}")
+    logger.info(f"  Total: {len(subfolders)}")
+    logger.info(f"Output folder: {output_folder}")
+    logger.info("="*60)
+
+
+def main():
+    """Main entry point for command-line usage."""
+    # Default behavior: no arguments = batch mode on Salidas/Imagen
+    if len(sys.argv) == 1:
+        # Get the script directory and construct default paths
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        input_folder = os.path.join(script_dir, "Salidas", "Imagen")
+        output_folder = os.path.join(script_dir, "tmp", "reconstructed")
+
+        try:
+            batch_reconstruct(input_folder, output_folder)
+        except Exception as e:
+            logger.error(f"Fatal error: {e}", exc_info=True)
+            sys.exit(1)
+        return
+
+    # Explicit argument mode
+    if len(sys.argv) < 3:
+        print(__doc__)
+        print("\nUsage (default - auto batch):")
+        print('  python reconstruct_tiles.py')
+        print("  (processes all subfolders in ./Salidas/Imagen -> ./tmp/reconstructed/)")
+        print("\nUsage (single case):")
+        print('  python reconstruct_tiles.py <input_folder> <output_path>')
+        print("\nUsage (batch - explicit paths):")
+        print('  python reconstruct_tiles.py <parent_folder> <output_folder> --batch')
+        print("\nExamples:")
+        print('  # Auto batch (default):')
+        print('  python reconstruct_tiles.py')
+        print('\n  # Single case:')
+        print('  python reconstruct_tiles.py "/path/to/18-139" "/path/to/output.png"')
+        print('\n  # Batch with explicit paths:')
+        print('  python reconstruct_tiles.py "/path/to/Salidas/Imagen" "/path/to/reconstructed" --batch')
+        sys.exit(1)
+
+    input_folder = sys.argv[1]
+    output_path = sys.argv[2]
+    batch_mode = '--batch' in sys.argv
+
+    try:
+        if batch_mode:
+            batch_reconstruct(input_folder, output_path)
+        else:
+            reconstruct_image(input_folder, output_path, verbose=True)
+    except Exception as e:
+        logger.error(f"Fatal error: {e}", exc_info=True)
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    main()
