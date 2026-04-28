@@ -28,6 +28,7 @@ Features:
 import os
 import re
 import sys
+import json
 import logging
 from pathlib import Path
 from typing import Dict, Tuple, List, Optional
@@ -102,12 +103,33 @@ def discover_tiles(folder: str) -> List[Tuple[str, Dict[str, int]]]:
     return tiles
 
 
-def calculate_canvas_dimensions(tiles: List[Tuple[str, Dict[str, int]]]) -> Tuple[int, int, int, int]:
+def load_metadata(folder: str) -> Optional[Dict]:
+    """
+    Load metadata.json from folder if it exists.
+
+    Args:
+        folder: Path to folder containing metadata.json
+
+    Returns:
+        Dict with metadata or None if file doesn't exist
+    """
+    metadata_path = os.path.join(folder, 'metadata.json')
+    if os.path.exists(metadata_path):
+        try:
+            with open(metadata_path, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Could not load metadata.json: {e}")
+    return None
+
+
+def calculate_canvas_dimensions(tiles: List[Tuple[str, Dict[str, int]]], zoom_scale: float = 1.0) -> Tuple[int, int, int, int]:
     """
     Calculate canvas dimensions and offset from tile coordinates.
 
     Args:
         tiles: List of (filename, coords_dict) tuples
+        zoom_scale: Zoom scale used during tiling (for dynamic sizing)
 
     Returns:
         Tuple of (canvas_width, canvas_height, min_x, min_y)
@@ -123,6 +145,8 @@ def calculate_canvas_dimensions(tiles: List[Tuple[str, Dict[str, int]]]) -> Tupl
     logger.info(f"Canvas dimensions: {canvas_width}x{canvas_height}")
     logger.info(f"X range: {min_x} to {max_x}")
     logger.info(f"Y range: {min_y} to {max_y}")
+    if zoom_scale != 1.0:
+        logger.info(f"Zoom scale detected: {zoom_scale}")
 
     return canvas_width, canvas_height, min_x, min_y
 
@@ -130,7 +154,8 @@ def calculate_canvas_dimensions(tiles: List[Tuple[str, Dict[str, int]]]) -> Tupl
 def reconstruct_image(
     folder: str,
     output_path: str,
-    verbose: bool = True
+    verbose: bool = True,
+    zoom_scale: float = 0.5
 ) -> None:
     """
     Reconstruct full image from tiles.
@@ -139,6 +164,7 @@ def reconstruct_image(
         folder: Path to folder containing tile PNGs
         output_path: Path where reconstructed image will be saved
         verbose: Print progress information
+        zoom_scale: Zoom scale used during tiling (default 0.5, override with metadata.json if exists)
 
     Raises:
         FileNotFoundError: If folder does not exist
@@ -160,7 +186,16 @@ def reconstruct_image(
 
     # Discover and parse tiles
     tiles = discover_tiles(folder)
-    canvas_w, canvas_h, min_x, min_y = calculate_canvas_dimensions(tiles)
+
+    # Load metadata to detect zoom scale (overrides parameter if exists)
+    metadata = load_metadata(folder)
+    if metadata:
+        zoom_scale = metadata.get('zoom_scale', zoom_scale)
+        logger.info(f"Loaded zoom_scale from metadata: {zoom_scale}")
+    else:
+        logger.info(f"Using zoom_scale parameter: {zoom_scale}")
+
+    canvas_w, canvas_h, min_x, min_y = calculate_canvas_dimensions(tiles, zoom_scale)
 
     # Create blank canvas (white background, RGB)
     logger.info(f"Creating canvas {canvas_w}x{canvas_h}...")
@@ -183,13 +218,16 @@ def reconstruct_image(
             paste_x = coords['x'] - min_x
             paste_y = coords['y'] - min_y
 
-            # Crop tile to actual content area (remove padding)
-            actual_width = coords['width']
-            actual_height = coords['height']
-            if tile_img.size[0] > actual_width or tile_img.size[1] > actual_height:
-                tile_img = tile_img.crop((0, 0, actual_width, actual_height))
+            # Scale tile to match coordinate space
+            # Coordinates are in original image space, tile pixels are in scaled space
+            # If zoom was 0.5, tile needs to be scaled up 2x to fill the original coordinates
+            scale_factor = 1.0 / zoom_scale if zoom_scale != 1.0 else 1.0
+            if scale_factor != 1.0:
+                new_width = int(tile_img.size[0] * scale_factor)
+                new_height = int(tile_img.size[1] * scale_factor)
+                tile_img = tile_img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-            # Paste tile
+            # Paste tile (now properly sized for original coordinate space)
             canvas.paste(tile_img, (paste_x, paste_y))
 
             if verbose and i % 5 == 0:
@@ -206,13 +244,14 @@ def reconstruct_image(
     logger.info(f"Final image size: {canvas.size}")
 
 
-def batch_reconstruct(parent_folder: str, output_folder: str) -> None:
+def batch_reconstruct(parent_folder: str, output_folder: str, zoom_scale: float = 0.5) -> None:
     """
     Recursively reconstruct all images from tile subfolders.
 
     Args:
         parent_folder: Path to parent folder containing case subfolders
         output_folder: Path where all reconstructed images will be saved
+        zoom_scale: Zoom scale used during tiling (default 0.5)
     """
     parent_folder = os.path.abspath(parent_folder)
     output_folder = os.path.abspath(output_folder)
@@ -248,7 +287,7 @@ def batch_reconstruct(parent_folder: str, output_folder: str) -> None:
 
         try:
             logger.info(f"[{i}/{len(subfolders)}] Processing {case_name}...")
-            reconstruct_image(case_path, output_path, verbose=False)
+            reconstruct_image(case_path, output_path, verbose=False, zoom_scale=zoom_scale)
             results['success'] += 1
             logger.info(f"  ✓ {case_name} reconstructed successfully")
         except Exception as e:
@@ -276,7 +315,7 @@ def main():
         output_folder = os.path.join(script_dir, "tmp", "reconstructed")
 
         try:
-            batch_reconstruct(input_folder, output_folder)
+            batch_reconstruct(input_folder, output_folder, zoom_scale=0.5)
         except Exception as e:
             logger.error(f"Fatal error: {e}", exc_info=True)
             sys.exit(1)
@@ -289,14 +328,16 @@ def main():
         print('  python reconstruct_tiles.py')
         print("  (processes all subfolders in ./Salidas/Imagen -> ./tmp/reconstructed/)")
         print("\nUsage (single case):")
-        print('  python reconstruct_tiles.py <input_folder> <output_path>')
+        print('  python reconstruct_tiles.py <input_folder> <output_path> [zoom_scale]')
         print("\nUsage (batch - explicit paths):")
-        print('  python reconstruct_tiles.py <parent_folder> <output_folder> --batch')
+        print('  python reconstruct_tiles.py <parent_folder> <output_folder> --batch [zoom_scale]')
         print("\nExamples:")
-        print('  # Auto batch (default):')
+        print('  # Auto batch (default, zoom=0.5):')
         print('  python reconstruct_tiles.py')
-        print('\n  # Single case:')
+        print('\n  # Single case with default zoom:')
         print('  python reconstruct_tiles.py "/path/to/18-139" "/path/to/output.png"')
+        print('\n  # Single case with custom zoom:')
+        print('  python reconstruct_tiles.py "/path/to/18-139" "/path/to/output.png" 0.5')
         print('\n  # Batch with explicit paths:')
         print('  python reconstruct_tiles.py "/path/to/Salidas/Imagen" "/path/to/reconstructed" --batch')
         sys.exit(1)
@@ -305,11 +346,22 @@ def main():
     output_path = sys.argv[2]
     batch_mode = '--batch' in sys.argv
 
+    # Parse zoom_scale from remaining arguments
+    zoom_scale = 0.5
+    for arg in sys.argv[3:]:
+        try:
+            val = float(arg)
+            if val > 0:
+                zoom_scale = val
+                break
+        except (ValueError, IndexError):
+            continue
+
     try:
         if batch_mode:
-            batch_reconstruct(input_folder, output_path)
+            batch_reconstruct(input_folder, output_path, zoom_scale=zoom_scale)
         else:
-            reconstruct_image(input_folder, output_path, verbose=True)
+            reconstruct_image(input_folder, output_path, verbose=True, zoom_scale=zoom_scale)
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)

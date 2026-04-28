@@ -1,4 +1,5 @@
 import os
+import json
 from PIL import Image
 import numpy as np
 from pathlib import Path
@@ -106,8 +107,8 @@ def is_mostly_background(tile, threshold=0.8):
 
 
 def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=0,
-                                bg_threshold=0.8, output_format='png', openslide_level=0,
-                                format_filter=None):
+                                zoom_scale=0.5, bg_threshold=0.8, output_format='png',
+                                openslide_level=0, format_filter=None):
     """
     Process histopathology images into tiles.
 
@@ -116,6 +117,7 @@ def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=
         output_dir: Directory for output tiles
         tile_size: Size of each tile in pixels (default 1536)
         overlap: Overlap between tiles in pixels (default 0)
+        zoom_scale: Scaling factor for image before tiling (default 1.0, e.g. 2.0 = 2x)
         bg_threshold: Threshold for background detection 0-1 (default 0.8)
         output_format: Output format: 'png', 'jpg', 'tiff' (default 'png')
         openslide_level: Resolution level for OpenSlide images (0=highest)
@@ -176,6 +178,17 @@ def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=
             else:
                 raise ValueError(f"Unsupported format: {file_ext}")
 
+            # Store original dimensions before scaling
+            original_width, original_height = width, height
+
+            # Apply zoom scaling
+            if zoom_scale != 1.0:
+                new_width = int(width * zoom_scale)
+                new_height = int(height * zoom_scale)
+                img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+                width, height = new_width, new_height
+                print(f"  Scaled to {zoom_scale}x: {width}x{height}")
+
             stride = tile_size - overlap
             saved_count = 0
 
@@ -193,8 +206,14 @@ def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=
 
                     # Skip background tiles
                     if not is_mostly_background(tile, bg_threshold):
+                        # Calculate original image coordinates (convert from scaled to original)
+                        orig_x = int(x / zoom_scale)
+                        orig_y = int(y / zoom_scale)
+                        orig_x_end = int(x_end / zoom_scale)
+                        orig_y_end = int(y_end / zoom_scale)
+
                         ext = '.' + output_format.lstrip('.')
-                        tile_name = f"{base_name}_tile_x{x:05d}_y{y:05d}_endx{x_end:05d}_endy{y_end:05d}{ext}"
+                        tile_name = f"{base_name}_tile_x{orig_x:05d}_y{orig_y:05d}_endx{orig_x_end:05d}_endy{orig_y_end:05d}{ext}"
                         tile_path = os.path.join(image_output_dir, tile_name)
 
                         # Pad tile to fixed size (1536x1536) with white background
@@ -211,7 +230,22 @@ def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=
                         if saved_count % 100 == 0:
                             print(f"  Saved {saved_count} tiles...", end='\r')
 
-            print(f"\n  Done. Saved {saved_count} tiles.\n")
+            # Save metadata about this image's processing
+            metadata = {
+                "base_name": base_name,
+                "original_width": original_width,
+                "original_height": original_height,
+                "zoom_scale": zoom_scale,
+                "tile_size": tile_size,
+                "overlap": overlap,
+                "bg_threshold": bg_threshold,
+                "tiles_saved": saved_count
+            }
+            metadata_path = os.path.join(image_output_dir, "metadata.json")
+            with open(metadata_path, 'w') as f:
+                json.dump(metadata, f, indent=2)
+
+            print(f"  Saved metadata to metadata.json\n")
 
         except Exception as e:
             print(f"\n  Error processing {file_name}: {e}\n")
@@ -230,6 +264,7 @@ if __name__ == "__main__":
         output_dir,
         tile_size=1536,
         overlap=256,
+        zoom_scale=0.5,
         bg_threshold=0.95,
         output_format='png',
         openslide_level=0
