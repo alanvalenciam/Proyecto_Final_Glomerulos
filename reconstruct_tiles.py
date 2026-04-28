@@ -103,26 +103,6 @@ def discover_tiles(folder: str) -> List[Tuple[str, Dict[str, int]]]:
     return tiles
 
 
-def load_metadata(folder: str) -> Optional[Dict]:
-    """
-    Load metadata.json from folder if it exists.
-
-    Args:
-        folder: Path to folder containing metadata.json
-
-    Returns:
-        Dict with metadata or None if file doesn't exist
-    """
-    metadata_path = os.path.join(folder, 'metadata.json')
-    if os.path.exists(metadata_path):
-        try:
-            with open(metadata_path, 'r') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.warning(f"Could not load metadata.json: {e}")
-    return None
-
-
 def calculate_canvas_dimensions(tiles: List[Tuple[str, Dict[str, int]]], zoom_scale: float = 1.0) -> Tuple[int, int, int, int]:
     """
     Calculate canvas dimensions and offset from tile coordinates.
@@ -187,13 +167,8 @@ def reconstruct_image(
     # Discover and parse tiles
     tiles = discover_tiles(folder)
 
-    # Load metadata to detect zoom scale (overrides parameter if exists)
-    metadata = load_metadata(folder)
-    if metadata:
-        zoom_scale = metadata.get('zoom_scale', zoom_scale)
-        logger.info(f"Loaded zoom_scale from metadata: {zoom_scale}")
-    else:
-        logger.info(f"Using zoom_scale parameter: {zoom_scale}")
+
+    zoom_scale = 0.5
 
     canvas_w, canvas_h, min_x, min_y = calculate_canvas_dimensions(tiles, zoom_scale)
 

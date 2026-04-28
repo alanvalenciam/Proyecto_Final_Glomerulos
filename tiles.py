@@ -106,8 +106,8 @@ def is_mostly_background(tile, threshold=0.8):
     return white_ratio > threshold
 
 
-def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=0,
-                                zoom_scale=0.5, bg_threshold=0.8, output_format='png',
+def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=256,
+                                zoom_scale=0.5, bg_threshold=0.99, output_format='png',
                                 openslide_level=0, format_filter=None):
     """
     Process histopathology images into tiles.
@@ -230,23 +230,6 @@ def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=
                         if saved_count % 100 == 0:
                             print(f"  Saved {saved_count} tiles...", end='\r')
 
-            # Save metadata about this image's processing
-            metadata = {
-                "base_name": base_name,
-                "original_width": original_width,
-                "original_height": original_height,
-                "zoom_scale": zoom_scale,
-                "tile_size": tile_size,
-                "overlap": overlap,
-                "bg_threshold": bg_threshold,
-                "tiles_saved": saved_count
-            }
-            metadata_path = os.path.join(image_output_dir, "metadata.json")
-            with open(metadata_path, 'w') as f:
-                json.dump(metadata, f, indent=2)
-
-            print(f"  Saved metadata to metadata.json\n")
-
         except Exception as e:
             print(f"\n  Error processing {file_name}: {e}\n")
             import traceback
@@ -265,7 +248,7 @@ if __name__ == "__main__":
         tile_size=1536,
         overlap=256,
         zoom_scale=0.5,
-        bg_threshold=0.95,
+        bg_threshold=0.99,
         output_format='png',
         openslide_level=0
     )
