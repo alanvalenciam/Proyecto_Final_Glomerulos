@@ -34,6 +34,11 @@ from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 from PIL import Image
 
+# Increase limits for large images (metadata chunks + pixel count)
+Image.MAX_IMAGE_PIXELS = 1_000_000_000  # 1 billion pixels
+from PIL import PngImagePlugin
+PngImagePlugin.MAX_TEXT_CHUNK = 100 * 1024 * 1024  # 100 MB for text chunks
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
