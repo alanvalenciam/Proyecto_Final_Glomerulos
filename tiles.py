@@ -99,11 +99,18 @@ def save_tile(tile, tile_path, output_format='png'):
 
 
 def is_mostly_background(tile, threshold=0.8):
-    """Check if tile is mostly white/background (grayscale > 140)."""
-    gray = np.array(tile.convert('L'))
-    white_pixels = np.sum(gray > 140)
-    white_ratio = white_pixels / gray.size
-    return white_ratio > threshold
+    """Check if tile is mostly white/background using color saturation.
+    Tissue has color (pink/purple), background is white (no saturation)."""
+    # Convert to HSV to detect color saturation
+    hsv = np.array(tile.convert('HSV'))
+    saturation = hsv[:, :, 1]  # Extract S channel (0=white, 255=saturated color)
+
+    # Count pixels with meaningful color (saturation > 30 means it's not white)
+    colored_pixels = np.sum(saturation > 30)
+    colored_ratio = colored_pixels / saturation.size
+
+    # Return True if tile is background (has low color), False if it has tissue
+    return colored_ratio < (1 - threshold)
 
 
 def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=256,
