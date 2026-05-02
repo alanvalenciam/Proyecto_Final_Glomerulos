@@ -31,7 +31,7 @@ import sys
 import json
 import logging
 from pathlib import Path
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Tuple, List, Optional, Union
 from PIL import Image
 
 # Increase limits for large images (metadata chunks + pixel count)
@@ -47,7 +47,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def parse_tile_coordinates(filename: str) -> Dict[str, int] | None:
+def parse_tile_coordinates(filename: str) -> Optional[Dict[str, int]]:
     """
     Extract (x, y, endx, endy) from tile filename.
 
@@ -140,7 +140,8 @@ def reconstruct_image(
     folder: str,
     output_path: str,
     verbose: bool = True,
-    zoom_scale: float = 0.5
+    zoom_scale: float = 0.5,
+    max_size_mb: int = 50
 ) -> None:
     """
     Reconstruct full image from tiles.
@@ -150,6 +151,7 @@ def reconstruct_image(
         output_path: Path where reconstructed image will be saved
         verbose: Print progress information
         zoom_scale: Zoom scale used during tiling (default 0.5, override with metadata.json if exists)
+        max_size_mb: Target maximum file size in MB (default 50)
 
     Raises:
         FileNotFoundError: If folder does not exist
@@ -217,11 +219,47 @@ def reconstruct_image(
             logger.error(f"Error processing {filename}: {e}")
             raise
 
-    # Save result
+    # Save result with compression and resizing to meet size target
     logger.info(f"Saving reconstructed image to {output_path}...")
-    canvas.save(output_path, 'PNG', quality=95)
-    logger.info(f"Success! Image saved to {output_path}")
-    logger.info(f"Final image size: {canvas.size}")
+    logger.info(f"Original canvas size: {canvas.size[0]}x{canvas.size[1]} pixels")
+
+    # Determine output format and compression strategy
+    output_ext = os.path.splitext(output_path)[1].lower()
+
+    # Start with quality 85, adjust down if needed
+    quality = 85
+    max_dimension = max(canvas.size)
+
+    # Estimate: reduce dimension if canvas is very large (>8000px)
+    scale_factor = 1.0
+    if max_dimension > 8000:
+        scale_factor = 8000.0 / max_dimension
+        logger.info(f"Downscaling image by {scale_factor:.2%} to reduce file size")
+        new_size = (int(canvas.size[0] * scale_factor), int(canvas.size[1] * scale_factor))
+        canvas = canvas.resize(new_size, Image.Resampling.LANCZOS)
+
+    # Save as JPEG for strong compression
+    save_format = 'JPEG'
+    save_path = output_path.replace(output_ext, '.jpg') if output_ext != '.jpg' else output_path
+
+    logger.info(f"Saving as JPEG with quality={quality}...")
+    canvas.save(save_path, save_format, quality=quality, optimize=True)
+
+    # Check file size and adjust quality if needed
+    file_size_mb = os.path.getsize(save_path) / (1024 * 1024)
+    logger.info(f"File size: {file_size_mb:.1f} MB")
+
+    # If still too large, reduce quality
+    while file_size_mb > max_size_mb and quality > 50:
+        quality -= 5
+        logger.info(f"File too large, reducing quality to {quality}...")
+        canvas.save(save_path, save_format, quality=quality, optimize=True)
+        file_size_mb = os.path.getsize(save_path) / (1024 * 1024)
+        logger.info(f"File size: {file_size_mb:.1f} MB")
+
+    logger.info(f"Success! Image saved to {save_path}")
+    logger.info(f"Final image size: {canvas.size[0]}x{canvas.size[1]} pixels")
+    logger.info(f"Final file size: {file_size_mb:.1f} MB")
 
 
 def batch_reconstruct(parent_folder: str, output_folder: str, zoom_scale: float = 0.5) -> None:
@@ -267,7 +305,7 @@ def batch_reconstruct(parent_folder: str, output_folder: str, zoom_scale: float 
 
         try:
             logger.info(f"[{i}/{len(subfolders)}] Processing {case_name}...")
-            reconstruct_image(case_path, output_path, verbose=False, zoom_scale=zoom_scale)
+            reconstruct_image(case_path, output_path, verbose=False, zoom_scale=zoom_scale, max_size_mb=50)
             results['success'] += 1
             logger.info(f"  ✓ {case_name} reconstructed successfully")
         except Exception as e:
@@ -341,7 +379,7 @@ def main():
         if batch_mode:
             batch_reconstruct(input_folder, output_path, zoom_scale=zoom_scale)
         else:
-            reconstruct_image(input_folder, output_path, verbose=True, zoom_scale=zoom_scale)
+            reconstruct_image(input_folder, output_path, verbose=True, zoom_scale=zoom_scale, max_size_mb=50)
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)
