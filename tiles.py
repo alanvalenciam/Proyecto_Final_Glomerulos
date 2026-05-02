@@ -1,5 +1,4 @@
 import os
-import json
 from PIL import Image
 import numpy as np
 from pathlib import Path
@@ -87,7 +86,7 @@ def save_tile(tile, tile_path, output_format='png'):
             tile.save(tile_path, 'TIFF', compression='lzw')
         else:
             raise ValueError(f"Unsupported format: {output_format}")
-    except Exception as e:
+    except Exception:
         if output_format == 'png':
             print(f"    PNG save failed, falling back to JPEG")
             tile_path = tile_path.replace('.png', '.jpg')
@@ -98,23 +97,33 @@ def save_tile(tile, tile_path, output_format='png'):
             raise
 
 
-def is_mostly_background(tile, threshold=0.8):
-    """Check if tile is mostly white/background using color saturation.
-    Tissue has color (pink/purple), background is white (no saturation)."""
-    # Convert to HSV to detect color saturation
+def is_mostly_background(tile, min_tissue_ratio=0.05):
+    """Return True if tile lacks tissue (should be skipped).
+
+    Uses HSV saturation: PAS tissue (purple/magenta) has S > 80,
+    scanner border/glass background has S clustered at 28-40.
+
+    Args:
+        tile: PIL Image to check
+        min_tissue_ratio: fraction of pixels with S > 80 required to keep tile (default 0.05 = 5%)
+
+    Returns:
+        True if tile is background only (should discard)
+        False if tile contains tissue (should keep)
+    """
     hsv = np.array(tile.convert('HSV'))
-    saturation = hsv[:, :, 1]  # Extract S channel (0=white, 255=saturated color)
+    saturation = hsv[:, :, 1]  # Extract S channel (0-255)
 
-    # Count pixels with meaningful color (saturation > 30 means it's not white)
-    colored_pixels = np.sum(saturation > 30)
-    colored_ratio = colored_pixels / saturation.size
+    # Count pixels with high saturation (tissue has S > 80, background has S < 40)
+    tissue_pixels = np.sum(saturation > 80)
+    tissue_ratio = tissue_pixels / saturation.size
 
-    # Return True if tile is background (has low color), False if it has tissue
-    return colored_ratio < (1 - threshold)
+    # Discard tile if less than min_tissue_ratio of pixels are tissue-colored
+    return tissue_ratio < min_tissue_ratio
 
 
 def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=256,
-                                zoom_scale=0.5, bg_threshold=0.99, output_format='png',
+                                zoom_scale=0.5, bg_threshold=0.05, output_format='png',
                                 openslide_level=0, format_filter=None):
     """
     Process histopathology images into tiles.
@@ -125,7 +134,7 @@ def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=
         tile_size: Size of each tile in pixels (default 1536)
         overlap: Overlap between tiles in pixels (default 0)
         zoom_scale: Scaling factor for image before tiling (default 1.0, e.g. 2.0 = 2x)
-        bg_threshold: Threshold for background detection 0-1 (default 0.8)
+        bg_threshold: Min tissue ratio (0-1) to keep tile. Default 0.05 means keep tile only if ≥5% pixels are tissue-colored (S>80 in HSV)
         output_format: Output format: 'png', 'jpg', 'tiff' (default 'png')
         openslide_level: Resolution level for OpenSlide images (0=highest)
         format_filter: List of formats to process (e.g. ['tiff', 'svs'])
@@ -185,9 +194,6 @@ def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=
             else:
                 raise ValueError(f"Unsupported format: {file_ext}")
 
-            # Store original dimensions before scaling
-            original_width, original_height = width, height
-
             # Apply zoom scaling
             if zoom_scale != 1.0:
                 new_width = int(width * zoom_scale)
@@ -204,10 +210,6 @@ def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=
                 for x in range(0, width, stride):
                     x_end = min(x + tile_size, width)
                     y_end = min(y + tile_size, height)
-
-                    # Get actual tile size before padding
-                    actual_width = x_end - x
-                    actual_height = y_end - y
 
                     tile = img.crop((x, y, x_end, y_end))
 
@@ -255,7 +257,7 @@ if __name__ == "__main__":
         tile_size=1536,
         overlap=256,
         zoom_scale=0.5,
-        bg_threshold=0.99,
+        bg_threshold=0.05,
         output_format='png',
         openslide_level=0
     )
