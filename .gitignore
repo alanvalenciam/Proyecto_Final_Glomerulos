@@ -11,3 +11,5 @@ AGENTS.md
 /docs
 /logs
 /tmp
+.gga
+.DS_Store
