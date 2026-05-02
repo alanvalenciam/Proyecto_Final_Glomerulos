@@ -97,33 +97,27 @@ def save_tile(tile, tile_path, output_format='png'):
             raise
 
 
-def is_mostly_background(tile, min_tissue_ratio=0.05):
+def is_mostly_background(tile, min_std=15.0):
     """Return True if tile lacks tissue (should be skipped).
 
-    Uses HSV saturation: PAS tissue (purple/magenta) has S > 80,
-    scanner border/glass background has S clustered at 28-40.
+    Uses grayscale standard deviation (texture) as a stain-agnostic signal.
+    Tissue always has std > 37 (cellular structure creates local variation).
+    Background (white glass or scanner border) has std < 12 (uniform).
 
     Args:
         tile: PIL Image to check
-        min_tissue_ratio: fraction of pixels with S > 80 required to keep tile (default 0.05 = 5%)
+        min_std: minimum grayscale std to keep tile (default 15.0 = midpoint between tissue floor 37 and bg ceiling 12)
 
     Returns:
-        True if tile is background only (should discard)
-        False if tile contains tissue (should keep)
+        True  → background only, discard
+        False → tissue present, keep
     """
-    hsv = np.array(tile.convert('HSV'))
-    saturation = hsv[:, :, 1]  # Extract S channel (0-255)
-
-    # Count pixels with high saturation (tissue has S > 80, background has S < 40)
-    tissue_pixels = np.sum(saturation > 80)
-    tissue_ratio = tissue_pixels / saturation.size
-
-    # Discard tile if less than min_tissue_ratio of pixels are tissue-colored
-    return tissue_ratio < min_tissue_ratio
+    gray = np.array(tile.convert('L'))
+    return float(np.std(gray)) < min_std
 
 
 def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=256,
-                                zoom_scale=0.5, bg_threshold=0.05, output_format='png',
+                                zoom_scale=0.5, bg_threshold=15.0, output_format='png',
                                 openslide_level=0, format_filter=None):
     """
     Process histopathology images into tiles.
@@ -134,7 +128,9 @@ def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=
         tile_size: Size of each tile in pixels (default 1536)
         overlap: Overlap between tiles in pixels (default 0)
         zoom_scale: Scaling factor for image before tiling (default 1.0, e.g. 2.0 = 2x)
-        bg_threshold: Min tissue ratio (0-1) to keep tile. Default 0.05 means keep tile only if ≥5% pixels are tissue-colored (S>80 in HSV)
+        bg_threshold: Minimum grayscale std deviation to keep tile (default 15.0). Stain-agnostic texture metric.
+                      Tissue (any stain) has std > 37. Background (white or gray) has std < 12.
+                      Threshold at 15.0 gives 3x safety margin. Lower to 12 to be more inclusive on edge tiles.
         output_format: Output format: 'png', 'jpg', 'tiff' (default 'png')
         openslide_level: Resolution level for OpenSlide images (0=highest)
         format_filter: List of formats to process (e.g. ['tiff', 'svs'])
@@ -257,7 +253,7 @@ if __name__ == "__main__":
         tile_size=1536,
         overlap=256,
         zoom_scale=0.5,
-        bg_threshold=0.05,
+        bg_threshold=15.0,
         output_format='png',
         openslide_level=0
     )
