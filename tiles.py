@@ -115,7 +115,7 @@ def save_tile(tile, tile_path, output_format='png'):
             raise
 
 
-def process_folder_to_subfolders(input_dir, output_dir, tile_size=1536, overlap=512,
+def process_folder_to_subfolders(input_dir, output_dir, tile_size=1024, overlap=256,
                                 target_mpp=0.5, zoom_scale=0.5, bg_threshold=15.0, output_format='png',
                                 openslide_level=0, format_filter=None, otsu_min_ratio=0.02):
     """
@@ -378,8 +378,8 @@ if __name__ == "__main__":
     process_folder_to_subfolders(
         input_dir,
         output_dir,
-        tile_size=1536,
-        overlap=512,           # 50% overlap for better tissue coverage
+        tile_size=1024,
+        overlap=256,           # 50% overlap for better tissue coverage
         target_mpp=0.5,        # Standard resolution for OpenSlide (20x equivalent)
         zoom_scale=0.5,        # Downsampling for PIL (TIFF) — captures 4x more native pixels
         bg_threshold=15.0,     # Less aggressive filter for low-quality staining
