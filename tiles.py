@@ -117,7 +117,7 @@ def save_tile(tile, tile_path, output_format='png'):
 
 def process_folder_to_subfolders(input_dir, output_dir, tile_size=1024, overlap=256,
                                 target_mpp=0.5, zoom_scale=0.5, bg_threshold=15.0, output_format='png',
-                                openslide_level=0, format_filter=None, otsu_min_ratio=0.02):
+                                openslide_level=0, format_filter=None, otsu_min_ratio=0.01):
     """
     Process histopathology images into tiles using MPP-aware resolution.
 
@@ -379,11 +379,11 @@ if __name__ == "__main__":
         input_dir,
         output_dir,
         tile_size=1024,
-        overlap=256,           # 50% overlap for better tissue coverage
+        overlap=256,           # 25% overlap for better tissue coverage
         target_mpp=0.5,        # Standard resolution for OpenSlide (20x equivalent)
         zoom_scale=0.5,        # Downsampling for PIL (TIFF) — captures 4x more native pixels
         bg_threshold=15.0,     # Less aggressive filter for low-quality staining
         output_format='png',
         openslide_level=0,
-        otsu_min_ratio=0.02    # 1% minimum tissue (permissive for weak staining)
+        otsu_min_ratio=0.01    # 1% minimum tissue (permissive for weak staining)
     )
