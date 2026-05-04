@@ -4,10 +4,18 @@ import json
 import logging
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
+from multiprocessing import Pool, cpu_count
+import time
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from shapely.geometry import shape
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -73,6 +81,109 @@ def find_geojson_files(input_dir: str) -> List[str]:
     if not files:
         logger.warning(f"No .geojson files found in {input_dir}")
     return files
+
+
+def _safe_worker_count(geojson_paths: List[str]) -> int:
+    """
+    Determine safe number of parallel workers based on available RAM.
+
+    Strategy:
+    - Get available RAM and reserve 30% (safety margin)
+    - Estimate per-file RAM: max_file_size × 2 (GeoJSON parsing overhead)
+    - workers = min(cpu_count(), max(1, available_ram / max_file_ram))
+
+    Returns:
+        int: Number of workers to use in the pool (minimum 1)
+    """
+    try:
+        if PSUTIL_AVAILABLE:
+            available_ram = psutil.virtual_memory().available
+        else:
+            available_ram = 4 * 1024 * 1024 * 1024  # Conservative fallback: 4GB
+
+        safe_ram = available_ram * 0.7
+
+        max_file_size = max(
+            os.path.getsize(p) for p in geojson_paths
+        ) if geojson_paths else 10 * 1024 * 1024
+
+        estimated_per_file_ram = max_file_size * 2
+
+        workers_by_ram = max(1, int(safe_ram / estimated_per_file_ram))
+        workers = min(cpu_count(), workers_by_ram)
+
+        logger.info(f"RAM-aware worker calculation: available={safe_ram / 1e9:.1f}GB, max_file={max_file_size / 1e6:.1f}MB, workers={workers}")
+        return workers
+
+    except Exception as e:
+        logger.warning(f"psutil RAM calculation failed ({e}), using conservative worker count")
+        return min(4, cpu_count())
+
+
+def _process_single_geojson(args) -> Tuple[str, List[Dict]]:
+    """
+    Worker function to analyze a single GeoJSON file in parallel.
+
+    Returns:
+        (geojson_path, rows_list) where rows_list is the processed geometries
+    """
+    geojson_path, zoom_scale = args
+
+    rows = []
+    dataset_name = Path(geojson_path).stem
+
+    try:
+        geojson_obj = load_geojson(geojson_path)
+        features = geojson_obj.get("features", [])
+
+        if not features:
+            logger.info(f"  SKIP - {dataset_name}: sin geometrías")
+            return (geojson_path, rows)
+
+        for idx, feature in enumerate(features):
+            geom_dict = feature.get("geometry", {})
+            props = feature.get("properties", {})
+
+            if not geom_dict:
+                continue
+
+            try:
+                geom = shape(geom_dict)
+                area = geom.area
+                minx, miny, maxx, maxy = geom.bounds
+                width = maxx - minx
+                height = maxy - miny
+                square_size = max(width, height)
+                perimeter = geom.length
+
+                if perimeter > 0:
+                    circularity = (4.0 * math.pi * area) / (perimeter ** 2)
+                else:
+                    circularity = 0.0
+
+                glomeruli_name = props.get("name", f"glomeruli_{idx+1}")
+
+                rows.append({
+                    "dataset": dataset_name,
+                    "name": glomeruli_name,
+                    "area_native_px2": round(area, 2),
+                    "width_native_px": round(width, 2),
+                    "height_native_px": round(height, 2),
+                    "square_size_native_px": round(square_size, 2),
+                    "perimeter_native_px": round(perimeter, 2),
+                    "circularity": round(circularity, 4),
+                    "area_tile_px2": round(area * zoom_scale ** 2, 2),
+                    "width_tile_px": round(width * zoom_scale, 2),
+                    "height_tile_px": round(height * zoom_scale, 2),
+                    "square_size_tile_px": round(square_size * zoom_scale, 2),
+                })
+            except Exception as e:
+                logger.warning(f"Error en {dataset_name} feature {idx}: {e}")
+
+    except Exception as e:
+        logger.error(f"Error procesando {dataset_name}: {e}")
+
+    return (geojson_path, rows)
 
 
 
@@ -559,65 +670,36 @@ if __name__ == "__main__":
     os.makedirs(OUTPUT_BASE, exist_ok=True)
 
     # Acumular todos los glomérulos sin análisis por-biopsia
-    logger.info("\n[2] Leyendo y consolidando glomérulos...")
+    logger.info("\n[2] Leyendo y consolidando glomérulos (parallelizado)...")
+
+    # Ordenar archivos por tamaño (más grandes primero para mejor load balancing)
+    geojson_files_sorted = sorted(
+        geojson_files,
+        key=lambda x: os.path.getsize(x),
+        reverse=True
+    )
+
+    # Preparar argumentos para workers
+    tasks = [(geojson_path, ZOOM_SCALE) for geojson_path in geojson_files_sorted]
+
+    # Calcular número seguro de workers
+    num_workers = _safe_worker_count(geojson_files_sorted)
+    logger.info(f"Iniciando procesamiento de {len(geojson_files)} archivos GeoJSON")
+    logger.info(f"Usando {num_workers} procesos en paralelo...\n")
+
+    start_time = time.time()
     all_rows = []
 
-    for geojson_path in geojson_files:
-        dataset_name = Path(geojson_path).stem
+    with Pool(num_workers) as pool:
+        for idx, (geojson_path, rows) in enumerate(pool.imap_unordered(_process_single_geojson, tasks), 1):
+            dataset_name = Path(geojson_path).stem
+            dataset_count = len(rows)
+            all_rows.extend(rows)
 
-        try:
-            geojson_obj = load_geojson(geojson_path)
-            features = geojson_obj.get("features", [])
-
-            if not features:
-                logger.info(f"  SKIP - {dataset_name}: sin geometrías")
-                continue
-
-            for idx, feature in enumerate(features):
-                geom_dict = feature.get("geometry", {})
-                props = feature.get("properties", {})
-
-                if not geom_dict:
-                    continue
-
-                try:
-                    geom = shape(geom_dict)
-                    area = geom.area
-                    minx, miny, maxx, maxy = geom.bounds
-                    width = maxx - minx
-                    height = maxy - miny
-                    square_size = max(width, height)
-                    perimeter = geom.length
-
-                    if perimeter > 0:
-                        circularity = (4.0 * math.pi * area) / (perimeter ** 2)
-                    else:
-                        circularity = 0.0
-
-                    glomeruli_name = props.get("name", f"glomeruli_{idx+1}")
-
-                    all_rows.append({
-                        "dataset": dataset_name,
-                        "name": glomeruli_name,
-                        "area_native_px2": round(area, 2),
-                        "width_native_px": round(width, 2),
-                        "height_native_px": round(height, 2),
-                        "square_size_native_px": round(square_size, 2),
-                        "perimeter_native_px": round(perimeter, 2),
-                        "circularity": round(circularity, 4),
-                        "area_tile_px2": round(area * ZOOM_SCALE ** 2, 2),
-                        "width_tile_px": round(width * ZOOM_SCALE, 2),
-                        "height_tile_px": round(height * ZOOM_SCALE, 2),
-                        "square_size_tile_px": round(square_size * ZOOM_SCALE, 2),
-                    })
-                except Exception as e:
-                    logger.warning(f"Error en {dataset_name} feature {idx}: {e}")
-
-            dataset_count = len([r for r in all_rows if r['dataset'] == dataset_name])
-            logger.info(f"  {dataset_name}: {dataset_count} glomérulos")
-
-        except Exception as e:
-            logger.error(f"  {dataset_name}: {e}")
+            if dataset_count > 0:
+                logger.info(f"  [{idx}/{len(geojson_files)}] {dataset_name}: {dataset_count} glomérulos")
+            else:
+                logger.info(f"  [{idx}/{len(geojson_files)}] {dataset_name}: SKIP - sin geometrías")
 
     if not all_rows:
         logger.error("No se pudieron procesar glomérulos.")

@@ -30,11 +30,20 @@ import sys
 import json
 import logging
 from typing import Dict, Tuple, List, Optional
+from pathlib import Path
+from multiprocessing import Pool, cpu_count
+import time
 from PIL import Image
 
 Image.MAX_IMAGE_PIXELS = 1_000_000_000
 from PIL import PngImagePlugin
 PngImagePlugin.MAX_TEXT_CHUNK = 100 * 1024 * 1024
+
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -105,6 +114,53 @@ def load_metadata(folder: str) -> Dict:
     }
 
 
+def _safe_worker_count(tile_folders: List[str]) -> int:
+    """
+    Determine safe number of parallel workers based on available RAM.
+
+    Strategy:
+    - Get available RAM and reserve 30% (safety margin)
+    - Estimate per-folder RAM: median_tile_size × max_tiles_in_folder × 1.5
+    - workers = min(cpu_count(), max(1, available_ram / max_folder_ram))
+
+    Returns:
+        int: Number of workers to use in the pool (minimum 1)
+    """
+    try:
+        if PSUTIL_AVAILABLE:
+            available_ram = psutil.virtual_memory().available
+        else:
+            available_ram = 4 * 1024 * 1024 * 1024  # Conservative fallback: 4GB
+
+        safe_ram = available_ram * 0.7
+
+        # Estimate max per-folder size
+        max_folder_size = 0
+        for folder in tile_folders:
+            if os.path.isdir(folder):
+                folder_size = sum(
+                    os.path.getsize(os.path.join(folder, f))
+                    for f in os.listdir(folder)
+                    if f.endswith(('.png', '.jpg', '.jpeg'))
+                )
+                max_folder_size = max(max_folder_size, folder_size)
+
+        if max_folder_size == 0:
+            max_folder_size = 100 * 1024 * 1024  # Conservative: 100MB
+
+        estimated_per_folder_ram = max_folder_size * 1.5
+
+        workers_by_ram = max(1, int(safe_ram / estimated_per_folder_ram))
+        workers = min(cpu_count(), workers_by_ram)
+
+        logger.info(f"RAM-aware worker calculation: available={safe_ram / 1e9:.1f}GB, max_folder={max_folder_size / 1e9:.1f}GB, workers={workers}")
+        return workers
+
+    except Exception as e:
+        logger.warning(f"psutil RAM calculation failed ({e}), using conservative worker count")
+        return min(4, cpu_count())
+
+
 def calculate_canvas_dimensions(tiles: List[Tuple[str, Dict[str, int]]], downsample_ratio: float, image_format: str = 'pil') -> Tuple[int, int, int, int]:
     """Calculate canvas dimensions in target-mpp space."""
     min_x = min(t[1]['x'] for t in tiles)
@@ -137,13 +193,33 @@ def calculate_canvas_dimensions(tiles: List[Tuple[str, Dict[str, int]]], downsam
     return canvas_width, canvas_height, min_x, min_y
 
 
-def reconstruct_image(
+def _reconstruct_single_case(args) -> Tuple[str, bool, Optional[str]]:
+    """
+    Worker function to reconstruct a single case in parallel.
+
+    Args:
+        args: (case_path, output_path, verbose, max_size_mb)
+
+    Returns:
+        (case_name, success: bool, error_msg: Optional[str])
+    """
+    case_path, output_path, verbose, max_size_mb = args
+    case_name = os.path.basename(case_path)
+
+    try:
+        reconstruct_image_internal(case_path, output_path, verbose, max_size_mb)
+        return (case_name, True, None)
+    except Exception as e:
+        return (case_name, False, str(e))
+
+
+def reconstruct_image_internal(
     folder: str,
     output_path: str,
     verbose: bool = True,
     max_size_mb: int = 50
 ) -> None:
-    """Reconstruct full image from tiles."""
+    """Internal function that reconstructs full image from tiles."""
     folder = os.path.abspath(folder)
     output_path = os.path.abspath(output_path)
 
@@ -246,8 +322,8 @@ def reconstruct_image(
     logger.info(f"Final file size: {file_size_mb:.1f} MB")
 
 
-def batch_reconstruct(parent_folder: str, output_folder: str) -> None:
-    """Recursively reconstruct all images from tile subfolders."""
+def batch_reconstruct(parent_folder: str, output_folder: str, num_workers: Optional[int] = None) -> None:
+    """Recursively reconstruct all images from tile subfolders (parallelized)."""
     parent_folder = os.path.abspath(parent_folder)
     output_folder = os.path.abspath(output_folder)
 
@@ -266,33 +342,64 @@ def batch_reconstruct(parent_folder: str, output_folder: str) -> None:
 
     logger.info(f"Found {len(subfolders)} cases to process")
 
-    results = {'success': 0, 'failed': 0, 'skipped': 0}
+    # Filter folders with tiles and sort by size (largest first)
+    case_paths = [os.path.join(parent_folder, case) for case in subfolders]
+    cases_with_tiles = []
+    skipped_count = 0
 
-    for i, case_name in enumerate(subfolders, 1):
-        case_path = os.path.join(parent_folder, case_name)
-        output_path = os.path.join(output_folder, f"{case_name}_reconstructed.jpg")
-
+    for case_path, case_name in zip(case_paths, subfolders):
         has_tiles = any(f.endswith(('.png', '.jpg', '.jpeg')) for f in os.listdir(case_path))
         if not has_tiles:
-            logger.warning(f"[{i}/{len(subfolders)}] SKIPPED {case_name}: No tiles found")
-            results['skipped'] += 1
-            continue
+            logger.info(f"SKIPPED {case_name}: No tiles found")
+            skipped_count += 1
+        else:
+            cases_with_tiles.append((case_path, case_name))
 
-        try:
-            logger.info(f"[{i}/{len(subfolders)}] Processing {case_name}...")
-            reconstruct_image(case_path, output_path, verbose=False, max_size_mb=50)
-            results['success'] += 1
-            logger.info(f"  ✓ {case_name} reconstructed successfully")
-        except Exception as e:
-            results['failed'] += 1
-            logger.error(f"  ✗ {case_name} failed: {e}")
+    # Sort by folder size (largest first)
+    cases_with_tiles.sort(
+        key=lambda x: sum(os.path.getsize(os.path.join(x[0], f)) for f in os.listdir(x[0])),
+        reverse=True
+    )
 
-    logger.info("="*60)
+    if not cases_with_tiles:
+        logger.info(f"No cases with tiles found")
+        return
+
+    logger.info(f"Found {len(cases_with_tiles)} cases with tiles, {skipped_count} skipped")
+
+    # Determine number of workers
+    if num_workers is None:
+        num_workers = _safe_worker_count([case[0] for case in cases_with_tiles])
+
+    logger.info(f"Using {num_workers} parallel worker(s) for {len(cases_with_tiles)} cases\n")
+
+    # Build task arguments
+    tasks = [
+        (case_path, os.path.join(output_folder, f"{case_name}_reconstructed.jpg"), False, 50)
+        for case_path, case_name in cases_with_tiles
+    ]
+
+    results = {'success': 0, 'failed': 0, 'skipped': skipped_count}
+    start_time = time.time()
+
+    # Process in parallel
+    with Pool(num_workers) as pool:
+        for idx, (case_name, success, error_msg) in enumerate(pool.imap_unordered(_reconstruct_single_case, tasks), 1):
+            if success:
+                results['success'] += 1
+                logger.info(f"[{idx}/{len(cases_with_tiles)}] ✓ {case_name} reconstructed")
+            else:
+                results['failed'] += 1
+                logger.error(f"[{idx}/{len(cases_with_tiles)}] ✗ {case_name} failed: {error_msg}")
+
+    elapsed = time.time() - start_time
+    logger.info("\n" + "="*60)
     logger.info("RECONSTRUCTION SUMMARY")
     logger.info(f"  Success: {results['success']}")
     logger.info(f"  Failed: {results['failed']}")
     logger.info(f"  Skipped: {results['skipped']}")
     logger.info(f"  Total: {len(subfolders)}")
+    logger.info(f"  Time: {elapsed:.1f}s")
     logger.info(f"Output folder: {output_folder}")
     logger.info("="*60)
 
