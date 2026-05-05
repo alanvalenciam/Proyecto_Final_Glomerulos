@@ -178,14 +178,55 @@ def process_folder(input_dir, output_dir, template_path, num_workers=None):
     logger.info(f"Complete! {len(archivos)} tiles normalized in {elapsed:.2f}s")
 
 if __name__ == "__main__":
-    # --- RUTAS ---
-    # Asegúrate de que aquí estén LOS RECORTES (los archivos tile_x000_y000.png)
-    input_dir = r"D:\Anotaciones\Salidas\BR-007-HYE-25-CONV"
-    
-    # Aquí se guardarán los recortes normalizados
-    output_dir = r"D:\Anotaciones\Recortes_Normalizados"
-    
-    # Tu imagen de referencia
-    template_path = r"D:\Anotaciones\Referencias\BR-007-HYE-25-CONV_tile_x01024_y05632.png"
-    
-    process_folder(input_dir, output_dir, template_path)
+    import argparse
+
+    # Defaults
+    base_dir = Path("/Users/olivera/Documents/Proyecto_Final_Glomerulos/Salidas/Imagen")
+    default_input = str(base_dir)
+    default_output = str(base_dir.parent / "Normalizados")
+    default_template = "/Users/olivera/Documents/Proyecto_Final_Glomerulos/referencia_reinhard.png"
+
+    parser = argparse.ArgumentParser(
+        description="Normalización de Reinhard para tiles histopatológicos",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Uso por defecto (sin argumentos):
+  python3 normalizacion.py
+
+Rutas por defecto:
+  --input    """ + default_input + """
+  --output   """ + default_output + """
+  --template """ + default_template + """
+
+Uso personalizado:
+  python3 normalizacion.py \\
+    --input /ruta/a/tiles \\
+    --output /ruta/salida \\
+    --template /ruta/referencia.png
+        """
+    )
+
+    parser.add_argument(
+        "--input",
+        default=default_input,
+        help=f"Carpeta raíz con tiles (default: {default_input})"
+    )
+    parser.add_argument(
+        "--output",
+        default=default_output,
+        help=f"Carpeta de salida para tiles normalizados (default: {default_output})"
+    )
+    parser.add_argument(
+        "--template",
+        default=default_template,
+        help=f"Ruta al tile de referencia (default: {default_template})"
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Número de workers paralelos (default: auto-calcula basado en RAM)"
+    )
+
+    args = parser.parse_args()
+    process_folder(args.input, args.output, args.template, num_workers=args.workers)
