@@ -4,6 +4,8 @@ import logging
 from PIL import Image
 import numpy as np
 from pathlib import Path
+from multiprocessing import Pool, cpu_count
+import time
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -30,6 +32,41 @@ except ImportError:
 OPENSLIDE_FORMATS = {'.svs', '.ndpi', '.vms'}
 PIL_FORMATS = {'.tif', '.tiff', '.png', '.jpg', '.jpeg'}
 ALL_FORMATS = OPENSLIDE_FORMATS | PIL_FORMATS
+
+
+def _safe_worker_count(image_paths):
+    """
+    Compute safe worker count based on available RAM and image sizes.
+
+    TIFFs decompress to ~4x their file size in memory.
+    Uses psutil if available, falls back to conservative estimate.
+    """
+    try:
+        import psutil
+        available_gb = psutil.virtual_memory().available / (1024**3)
+    except ImportError:
+        available_gb = 4.0  # Conservative fallback
+
+    max_file_size_gb = 0.0
+    for path in image_paths:
+        if os.path.exists(path):
+            size_gb = os.path.getsize(path) / (1024**3)
+            max_file_size_gb = max(max_file_size_gb, size_gb)
+
+    if max_file_size_gb == 0:
+        max_file_size_gb = 1.0
+
+    expansion_factor = 4  # TIFFs decompress to ~4x
+    memory_per_worker = max_file_size_gb * expansion_factor
+
+    if memory_per_worker > 0:
+        num_workers = int((available_gb * 0.7) / memory_per_worker)
+        num_workers = max(1, min(num_workers, cpu_count()))
+    else:
+        num_workers = min(4, cpu_count())
+
+    logger.info(f"RAM-aware: {available_gb:.2f}GB available, max file {max_file_size_gb:.3f}GB → {num_workers} workers")
+    return num_workers
 
 
 def detect_format(file_path):
@@ -115,11 +152,238 @@ def save_tile(tile, tile_path, output_format='png'):
             raise
 
 
+def _process_single_image(args):
+    """
+    Process a single image to tiles. Worker function for multiprocessing.
+
+    Args:
+        args: Tuple of (file_name, input_dir, output_dir, tile_size, overlap,
+                        target_mpp, zoom_scale, bg_threshold, output_format,
+                        openslide_level, otsu_min_ratio)
+
+    Returns:
+        str: base_name if successful, None if failed.
+    """
+    (file_name, input_dir, output_dir, tile_size, overlap, target_mpp,
+     zoom_scale, bg_threshold, output_format, openslide_level, otsu_min_ratio) = args
+
+    image_path = os.path.join(input_dir, file_name)
+    base_name = os.path.splitext(file_name)[0]
+    file_ext = os.path.splitext(file_name)[1].lower()
+
+    image_output_dir = os.path.join(output_dir, "Imagen", base_name)
+    Path(image_output_dir).mkdir(parents=True, exist_ok=True)
+
+    logger.info(f"Processing: {file_name}")
+    logger.info(f"  Type: {file_ext[1:].upper()}")
+    logger.info(f"  Output dir: {image_output_dir}")
+
+    try:
+        handler = detect_format(image_path)
+        mask = None
+        downsample_factor = None
+        metadata = {}
+
+        if handler == 'openslide':
+            slide = openslide.open_slide(image_path)
+            native_width, native_height = slide.level_dimensions[0]
+            level_count = slide.level_count
+            logger.info(f"  Dimensions (level 0): {native_width}x{native_height}")
+            logger.info(f"  Resolution levels: {level_count}")
+
+            # Get native MPP and compute downsampling
+            try:
+                native_mpp = float(slide.properties.get('openslide.mpp-x', 0))
+                if native_mpp > 0 and target_mpp > 0:
+                    downsample_ratio = target_mpp / native_mpp
+                    logger.info(f"  Native MPP: {native_mpp:.4f} µm/px")
+                    logger.info(f"  Downsampling ratio: {downsample_ratio:.4f}")
+                else:
+                    raise ValueError("Invalid MPP values")
+            except (ValueError, TypeError, AttributeError):
+                logger.warning("Could not determine native MPP, using full resolution")
+                native_mpp = None
+                downsample_ratio = 1.0
+
+            # Generate Otsu mask
+            if OPENCV_AVAILABLE:
+                mask, downsample_factor = generate_otsu_mask(slide, downsample_factor=20)
+                logger.info(f"  Otsu mask generated (downsample × {downsample_factor})")
+
+            # Compute iteration parameters in native space
+            native_tile_size = int(tile_size * downsample_ratio)
+            native_stride = int((tile_size - overlap) * downsample_ratio)
+
+            saved_count = 0
+            skipped_count = 0
+
+            # Iterate in NATIVE (level 0) coordinate space
+            for y in range(0, native_height, native_stride):
+                for x in range(0, native_width, native_stride):
+                    native_x = x
+                    native_y = y
+                    native_x_end = min(x + native_tile_size, native_width)
+                    native_y_end = min(y + native_tile_size, native_height)
+
+                    # Fast pre-check via Otsu mask
+                    if mask is not None and not has_tissue_in_mask(mask, native_x, native_y, native_tile_size, downsample_factor, min_ratio=otsu_min_ratio):
+                        skipped_count += 1
+                        continue
+
+                    # Read tile from slide at native resolution
+                    tile_pil = slide.read_region((native_x, native_y), 0, (native_tile_size, native_tile_size))
+                    if tile_pil.mode == 'RGBA':
+                        tile = Image.new('RGB', tile_pil.size, (255, 255, 255))
+                        tile.paste(tile_pil, mask=tile_pil.split()[3])
+                    else:
+                        tile = tile_pil.convert('RGB') if tile_pil.mode != 'RGB' else tile_pil
+
+                    # Resize to output tile_size (at target_mpp)
+                    if tile.size != (tile_size, tile_size):
+                        tile = tile.resize((tile_size, tile_size), Image.Resampling.LANCZOS)
+
+                    # Secondary filter: grayscale std
+                    if is_mostly_background(tile, bg_threshold):
+                        skipped_count += 1
+                        continue
+
+                    # Save tile with NATIVE coordinates in filename
+                    ext = '.' + output_format.lstrip('.')
+                    tile_name = f"{base_name}_tile_x{native_x:05d}_y{native_y:05d}_endx{native_x_end:05d}_endy{native_y_end:05d}{ext}"
+                    tile_path = os.path.join(image_output_dir, tile_name)
+
+                    # Pad tile to fixed size with white background
+                    if tile.size != (tile_size, tile_size):
+                        padded_tile = Image.new('RGB', (tile_size, tile_size), (255, 255, 255))
+                        padded_tile.paste(tile, (0, 0))
+                        tile = padded_tile
+
+                    save_tile(tile, tile_path, output_format)
+                    saved_count += 1
+
+                    if saved_count % 100 == 0:
+                        logger.info(f"  Saved {saved_count} tiles...")
+
+            logger.info(f"  Final: {saved_count} tiles saved, {skipped_count} background tiles skipped")
+
+            # Save metadata
+            metadata = {
+                "native_mpp": native_mpp,
+                "target_mpp": target_mpp,
+                "downsample_ratio": downsample_ratio,
+                "tile_size": tile_size,
+                "overlap": overlap,
+                "native_width": native_width,
+                "native_height": native_height,
+                "format": "openslide"
+            }
+
+        elif handler == 'pil':
+            img = Image.open(image_path)
+            if img.mode == 'RGBA':
+                rgb_image = Image.new('RGB', img.size, (255, 255, 255))
+                rgb_image.paste(img, mask=img.split()[3])
+                img = rgb_image
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            native_width, native_height = img.size
+            logger.info(f"  Dimensions: {native_width}x{native_height}")
+
+            # PIL images: tile using zoom_scale (no MPP metadata available)
+            # DPI metadata in TIFF is often screen resolution (96 DPI), not microscopy calibration
+            # Users should provide calibrated WSI files (SVS/NDPI) for MPP-aware tiling
+            native_mpp = None
+            downsample_ratio = zoom_scale
+            logger.info(f"  Tiling with zoom_scale={zoom_scale} (native capture × {1/zoom_scale:.1f})")
+            logger.info("Tip: For MPP-aware tiling, use OpenSlide formats (SVS, NDPI, VMS)")
+
+            # Generate Otsu mask
+            if OPENCV_AVAILABLE:
+                mask, downsample_factor = generate_otsu_mask(img, downsample_factor=20)
+                logger.info(f"  Otsu mask generated (downsample × {downsample_factor})")
+
+            native_tile_size = int(tile_size / zoom_scale)
+            native_stride = int((tile_size - overlap) / zoom_scale)
+            saved_count = 0
+            skipped_count = 0
+
+            # Iterate in native (source) space
+            for y in range(0, native_height, native_stride):
+                for x in range(0, native_width, native_stride):
+                    x_end = min(x + native_tile_size, native_width)
+                    y_end = min(y + native_tile_size, native_height)
+
+                    # Read larger region from original
+                    tile = img.crop((x, y, x_end, y_end))
+
+                    # Fast pre-check via Otsu mask
+                    if mask is not None and not has_tissue_in_mask(mask, x, y, native_tile_size, downsample_factor, min_ratio=otsu_min_ratio):
+                        skipped_count += 1
+                        continue
+
+                    # Resize to output tile_size
+                    if tile.size != (tile_size, tile_size):
+                        tile = tile.resize((tile_size, tile_size), Image.Resampling.LANCZOS)
+
+                    # Secondary filter: grayscale std (on resized tile)
+                    if is_mostly_background(tile, bg_threshold):
+                        skipped_count += 1
+                        continue
+
+                    # Save tile with NATIVE coordinates in filename
+                    ext = '.' + output_format.lstrip('.')
+                    tile_name = f"{base_name}_tile_x{x:05d}_y{y:05d}_endx{x_end:05d}_endy{y_end:05d}{ext}"
+                    tile_path = os.path.join(image_output_dir, tile_name)
+
+                    # Pad tile to fixed size if needed (edge tiles)
+                    if tile.size != (tile_size, tile_size):
+                        padded_tile = Image.new('RGB', (tile_size, tile_size), (255, 255, 255))
+                        padded_tile.paste(tile, (0, 0))
+                        tile = padded_tile
+
+                    save_tile(tile, tile_path, output_format)
+                    saved_count += 1
+
+                    if saved_count % 100 == 0:
+                        logger.info(f"  Saved {saved_count} tiles...")
+
+            logger.info(f"  Final: {saved_count} tiles saved, {skipped_count} background tiles skipped")
+
+            # Save metadata
+            metadata = {
+                "native_mpp": native_mpp,
+                "target_mpp": None,
+                "downsample_ratio": zoom_scale,
+                "tile_size": tile_size,
+                "overlap": overlap,
+                "native_width": native_width,
+                "native_height": native_height,
+                "format": "pil",
+                "zoom_scale": zoom_scale
+            }
+
+        else:
+            raise ValueError(f"Unsupported format: {file_ext}")
+
+        # Save metadata.json
+        metadata_path = os.path.join(image_output_dir, "metadata.json")
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        logger.info(f"  Metadata saved to metadata.json")
+
+        return base_name
+
+    except Exception as e:
+        logger.error(f"Error processing {file_name}: {e}", exc_info=True)
+        return None
+
+
 def process_folder_to_subfolders(input_dir, output_dir, tile_size=1024, overlap=256,
                                 target_mpp=0.5, zoom_scale=0.5, bg_threshold=15.0, output_format='png',
-                                openslide_level=0, format_filter=None, otsu_min_ratio=0.01):
+                                openslide_level=0, format_filter=None, otsu_min_ratio=0.01, num_workers=None):
     """
-    Process histopathology images into tiles using MPP-aware resolution.
+    Process histopathology images into tiles using MPP-aware resolution with parallel processing.
 
     Args:
         input_dir: Directory containing input images
@@ -134,6 +398,7 @@ def process_folder_to_subfolders(input_dir, output_dir, tile_size=1024, overlap=
         format_filter: List of formats to process
         otsu_min_ratio: Minimum tissue ratio in Otsu mask (default 0.01 = 1%).
                        Use 0.01-0.02 for normal quality, 0.005-0.01 for low-quality staining.
+        num_workers: Number of parallel workers (None = auto-calculate based on RAM)
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -159,216 +424,36 @@ def process_folder_to_subfolders(input_dir, output_dir, tile_size=1024, overlap=
     logger.info(f"Target MPP: {target_mpp} µm/px")
     logger.info(f"Output format: {output_format.upper()}")
 
-    for file_name in imagenes_a_procesar:
-        image_path = os.path.join(input_dir, file_name)
-        base_name = os.path.splitext(file_name)[0]
-        file_ext = os.path.splitext(file_name)[1].lower()
+    # Sort images by file size (descending) for load balancing
+    image_paths = [os.path.join(input_dir, f) for f in imagenes_a_procesar]
+    image_paths.sort(key=lambda p: os.path.getsize(p) if os.path.exists(p) else 0, reverse=True)
+    imagenes_a_procesar = [os.path.basename(p) for p in image_paths]
 
-        image_output_dir = os.path.join(output_dir, "Imagen", base_name)
-        Path(image_output_dir).mkdir(parents=True, exist_ok=True)
+    # Calculate num_workers if not provided
+    if num_workers is None:
+        num_workers = _safe_worker_count(image_paths)
 
-        logger.info(f"Processing: {file_name}")
-        logger.info(f"  Type: {file_ext[1:].upper()}")
-        logger.info(f"  Output dir: {image_output_dir}")
+    # Build task list for multiprocessing
+    tasks = [
+        (file_name, input_dir, output_dir, tile_size, overlap,
+         target_mpp, zoom_scale, bg_threshold, output_format,
+         openslide_level, otsu_min_ratio)
+        for file_name in imagenes_a_procesar
+    ]
 
-        try:
-            handler = detect_format(image_path)
-            mask = None
-            downsample_factor = None
-            metadata = {}
+    logger.info(f"Starting parallel processing with {num_workers} workers...")
+    start_time = time.time()
 
-            if handler == 'openslide':
-                slide = openslide.open_slide(image_path)
-                native_width, native_height = slide.level_dimensions[0]
-                level_count = slide.level_count
-                logger.info(f"  Dimensions (level 0): {native_width}x{native_height}")
-                logger.info(f"  Resolution levels: {level_count}")
-
-                # Get native MPP and compute downsampling
-                try:
-                    native_mpp = float(slide.properties.get('openslide.mpp-x', 0))
-                    if native_mpp > 0 and target_mpp > 0:
-                        downsample_ratio = target_mpp / native_mpp
-                        logger.info(f"  Native MPP: {native_mpp:.4f} µm/px")
-                        logger.info(f"  Downsampling ratio: {downsample_ratio:.4f}")
-                    else:
-                        raise ValueError("Invalid MPP values")
-                except (ValueError, TypeError, AttributeError):
-                    logger.warning("Could not determine native MPP, using full resolution")
-                    native_mpp = None
-                    downsample_ratio = 1.0
-
-                # Generate Otsu mask
-                if OPENCV_AVAILABLE:
-                    mask, downsample_factor = generate_otsu_mask(slide, downsample_factor=20)
-                    logger.info(f"  Otsu mask generated (downsample × {downsample_factor})")
-
-                # Compute iteration parameters in native space
-                native_tile_size = int(tile_size * downsample_ratio)
-                native_stride = int((tile_size - overlap) * downsample_ratio)
-
-                saved_count = 0
-                skipped_count = 0
-
-                # Iterate in NATIVE (level 0) coordinate space
-                for y in range(0, native_height, native_stride):
-                    for x in range(0, native_width, native_stride):
-                        native_x = x
-                        native_y = y
-                        native_x_end = min(x + native_tile_size, native_width)
-                        native_y_end = min(y + native_tile_size, native_height)
-
-                        # Fast pre-check via Otsu mask
-                        if mask is not None and not has_tissue_in_mask(mask, native_x, native_y, native_tile_size, downsample_factor, min_ratio=otsu_min_ratio):
-                            skipped_count += 1
-                            continue
-
-                        # Read tile from slide at native resolution
-                        tile_pil = slide.read_region((native_x, native_y), 0, (native_tile_size, native_tile_size))
-                        if tile_pil.mode == 'RGBA':
-                            tile = Image.new('RGB', tile_pil.size, (255, 255, 255))
-                            tile.paste(tile_pil, mask=tile_pil.split()[3])
-                        else:
-                            tile = tile_pil.convert('RGB') if tile_pil.mode != 'RGB' else tile_pil
-
-                        # Resize to output tile_size (at target_mpp)
-                        if tile.size != (tile_size, tile_size):
-                            tile = tile.resize((tile_size, tile_size), Image.Resampling.LANCZOS)
-
-                        # Secondary filter: grayscale std
-                        if is_mostly_background(tile, bg_threshold):
-                            skipped_count += 1
-                            continue
-
-                        # Save tile with NATIVE coordinates in filename
-                        ext = '.' + output_format.lstrip('.')
-                        tile_name = f"{base_name}_tile_x{native_x:05d}_y{native_y:05d}_endx{native_x_end:05d}_endy{native_y_end:05d}{ext}"
-                        tile_path = os.path.join(image_output_dir, tile_name)
-
-                        # Pad tile to fixed size with white background
-                        if tile.size != (tile_size, tile_size):
-                            padded_tile = Image.new('RGB', (tile_size, tile_size), (255, 255, 255))
-                            padded_tile.paste(tile, (0, 0))
-                            tile = padded_tile
-
-                        save_tile(tile, tile_path, output_format)
-                        saved_count += 1
-
-                        if saved_count % 100 == 0:
-                            logger.info(f"  Saved {saved_count} tiles...")
-
-                logger.info(f"  Final: {saved_count} tiles saved, {skipped_count} background tiles skipped")
-
-                # Save metadata
-                metadata = {
-                    "native_mpp": native_mpp,
-                    "target_mpp": target_mpp,
-                    "downsample_ratio": downsample_ratio,
-                    "tile_size": tile_size,
-                    "overlap": overlap,
-                    "native_width": native_width,
-                    "native_height": native_height,
-                    "format": "openslide"
-                }
-
-            elif handler == 'pil':
-                img = Image.open(image_path)
-                if img.mode == 'RGBA':
-                    rgb_image = Image.new('RGB', img.size, (255, 255, 255))
-                    rgb_image.paste(img, mask=img.split()[3])
-                    img = rgb_image
-                elif img.mode != 'RGB':
-                    img = img.convert('RGB')
-
-                native_width, native_height = img.size
-                logger.info(f"  Dimensions: {native_width}x{native_height}")
-
-                # PIL images: tile using zoom_scale (no MPP metadata available)
-                # DPI metadata in TIFF is often screen resolution (96 DPI), not microscopy calibration
-                # Users should provide calibrated WSI files (SVS/NDPI) for MPP-aware tiling
-                native_mpp = None
-                downsample_ratio = zoom_scale
-                logger.info(f"  Tiling with zoom_scale={zoom_scale} (native capture × {1/zoom_scale:.1f})")
-                logger.info("Tip: For MPP-aware tiling, use OpenSlide formats (SVS, NDPI, VMS)")
-
-                # Generate Otsu mask
-                if OPENCV_AVAILABLE:
-                    mask, downsample_factor = generate_otsu_mask(img, downsample_factor=20)
-                    logger.info(f"  Otsu mask generated (downsample × {downsample_factor})")
-
-                native_tile_size = int(tile_size / zoom_scale)
-                native_stride = int((tile_size - overlap) / zoom_scale)
-                saved_count = 0
-                skipped_count = 0
-
-                # Iterate in native (source) space
-                for y in range(0, native_height, native_stride):
-                    for x in range(0, native_width, native_stride):
-                        x_end = min(x + native_tile_size, native_width)
-                        y_end = min(y + native_tile_size, native_height)
-
-                        # Read larger region from original
-                        tile = img.crop((x, y, x_end, y_end))
-
-                        # Fast pre-check via Otsu mask
-                        if mask is not None and not has_tissue_in_mask(mask, x, y, native_tile_size, downsample_factor, min_ratio=otsu_min_ratio):
-                            skipped_count += 1
-                            continue
-
-                        # Resize to output tile_size
-                        if tile.size != (tile_size, tile_size):
-                            tile = tile.resize((tile_size, tile_size), Image.Resampling.LANCZOS)
-
-                        # Secondary filter: grayscale std (on resized tile)
-                        if is_mostly_background(tile, bg_threshold):
-                            skipped_count += 1
-                            continue
-
-                        # Save tile with NATIVE coordinates in filename
-                        ext = '.' + output_format.lstrip('.')
-                        tile_name = f"{base_name}_tile_x{x:05d}_y{y:05d}_endx{x_end:05d}_endy{y_end:05d}{ext}"
-                        tile_path = os.path.join(image_output_dir, tile_name)
-
-                        # Pad tile to fixed size if needed (edge tiles)
-                        if tile.size != (tile_size, tile_size):
-                            padded_tile = Image.new('RGB', (tile_size, tile_size), (255, 255, 255))
-                            padded_tile.paste(tile, (0, 0))
-                            tile = padded_tile
-
-                        save_tile(tile, tile_path, output_format)
-                        saved_count += 1
-
-                        if saved_count % 100 == 0:
-                            logger.info(f"  Saved {saved_count} tiles...")
-
-                logger.info(f"  Final: {saved_count} tiles saved, {skipped_count} background tiles skipped")
-
-                # Save metadata
-                metadata = {
-                    "native_mpp": native_mpp,
-                    "target_mpp": None,
-                    "downsample_ratio": zoom_scale,
-                    "tile_size": tile_size,
-                    "overlap": overlap,
-                    "native_width": native_width,
-                    "native_height": native_height,
-                    "format": "pil",
-                    "zoom_scale": zoom_scale
-                }
-
+    # Process images in parallel
+    with Pool(processes=num_workers) as pool:
+        for i, result in enumerate(pool.imap_unordered(_process_single_image, tasks, chunksize=1), 1):
+            if result:
+                logger.info(f"Image {i}/{len(tasks)} completed: {result}")
             else:
-                raise ValueError(f"Unsupported format: {file_ext}")
+                logger.warning(f"Image {i}/{len(tasks)} failed")
 
-            # Save metadata.json
-            metadata_path = os.path.join(image_output_dir, "metadata.json")
-            with open(metadata_path, 'w') as f:
-                json.dump(metadata, f, indent=2)
-            logger.info(f"  Metadata saved to metadata.json")
-
-        except Exception as e:
-            logger.error(f"Error processing {file_name}: {e}", exc_info=True)
-
-    logger.info("Complete!")
+    elapsed = time.time() - start_time
+    logger.info(f"Complete! Elapsed time: {elapsed:.2f}s")
 
 
 if __name__ == "__main__":
