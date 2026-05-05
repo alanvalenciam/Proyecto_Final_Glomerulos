@@ -5,6 +5,9 @@ from pathlib import Path
 from multiprocessing import Pool, cpu_count
 import logging
 import time
+import random
+import json
+from typing import Optional, Tuple
 
 logging.basicConfig(
     level=logging.INFO,
@@ -13,12 +16,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _safe_worker_count(tile_paths):
+def _safe_worker_count(tile_size_hint: int = 1024) -> int:
     """
-    Compute safe worker count based on available RAM and tile sizes.
+    Compute safe worker count based on available RAM and tile pixel dimensions.
 
-    PNG tiles are small (~0.5-2 MB), but in memory they're ~3 channels × 3 bytes per pixel.
-    Expansion factor: 2x (PNG small, but decompressed + processing buffers).
+    Memory per worker = tile_size² × 3 channels × 6 bytes
+    (uint8 input + float32 LAB 4x + output + mask ≈ 18–30 MB per 1024×1024 tile).
     Uses psutil if available, falls back to conservative estimate.
     """
     try:
@@ -27,50 +30,115 @@ def _safe_worker_count(tile_paths):
     except ImportError:
         available_gb = 2.0  # Conservative fallback
 
-    max_file_size_gb = 0.0
-    for path in tile_paths:
-        if os.path.exists(path):
-            size_gb = os.path.getsize(path) / (1024**3)
-            max_file_size_gb = max(max_file_size_gb, size_gb)
+    # Pixel-based RAM estimation: uint8 + float32 LAB + output + mask
+    bytes_per_worker = tile_size_hint * tile_size_hint * 3 * 6
+    gb_per_worker = bytes_per_worker / (1024**3)
 
-    if max_file_size_gb == 0:
-        max_file_size_gb = 0.005  # ~5MB fallback for small tiles
-
-    expansion_factor = 2  # PNGs decompress to ~2x in memory
-    memory_per_worker = max_file_size_gb * expansion_factor
-
-    if memory_per_worker > 0:
-        num_workers = int((available_gb * 0.7) / memory_per_worker)
+    if gb_per_worker > 0:
+        num_workers = int((available_gb * 0.7) / gb_per_worker)
         num_workers = max(1, min(num_workers, cpu_count()))
     else:
         num_workers = min(4, cpu_count())
 
-    logger.info(f"RAM-aware: {available_gb:.2f}GB available, max file {max_file_size_gb:.6f}GB → {num_workers} workers")
+    logger.info(f"RAM-aware: {available_gb:.2f}GB available, ~{gb_per_worker*1024:.1f}MB per worker → {num_workers} workers")
     return num_workers
 
 
-def leer_imagen(ruta):
+def leer_imagen(ruta: str) -> Optional[np.ndarray]:
     """Lee imágenes en rutas con tildes o caracteres especiales en Windows"""
     return cv2.imdecode(np.fromfile(ruta, dtype=np.uint8), cv2.IMREAD_COLOR)
 
-def guardar_imagen(ruta, imagen):
+def guardar_imagen(ruta: str, imagen: np.ndarray) -> None:
     """Guarda imágenes en rutas con tildes o caracteres especiales en Windows"""
     cv2.imencode('.png', imagen)[1].tofile(ruta)
 
-def get_lab_stats(image_bgr):
-    """Calcula la media y desviación estándar en el espacio de color LAB"""
+def get_tissue_mask(image_bgr: np.ndarray, bg_l_threshold: int = 230, min_saturation: int = 10) -> np.ndarray:
+    """
+    Generate binary tissue mask combining LAB L and HSV S channels + morphology.
+
+    L channel alone (L < threshold) detects white background but misses dark noise (ink, dust, folds).
+    Combined with saturation (S > threshold) to exclude desaturated dark artifacts.
+    Apply morphological operations to clean up the mask.
+
+    Returns boolean mask where True = tissue pixel, False = background.
+    """
+    # L channel: exclude bright white background
+    lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB)
+    l_mask = lab[:, :, 0] < bg_l_threshold
+
+    # Saturation channel: exclude low-saturation dark noise (ink, dust have low S)
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    s_mask = hsv[:, :, 1] > min_saturation
+
+    # Combine: pixel must be dark AND have color → tissue
+    combined = (l_mask & s_mask).astype(np.uint8) * 255
+
+    # Morphological closing: fill small holes in tissue (nuclei, vessels)
+    close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    cleaned = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, close_kernel)
+
+    # Morphological opening: remove small isolated artifacts (dust, noise)
+    open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, open_kernel)
+
+    return cleaned.astype(bool)
+
+def get_lab_stats(image_bgr: np.ndarray, mask: Optional[np.ndarray] = None) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+    """
+    Compute LAB mean and std. If mask provided, use only tissue pixels.
+
+    Args:
+        image_bgr: Input BGR image
+        mask: Optional boolean mask (True = tissue, False = background).
+              If provided, stats are computed only on masked pixels.
+
+    Returns:
+        ((l_mean, a_mean, b_mean), (l_std, a_std, b_std))
+
+    Raises:
+        ValueError: If tissue pixels < 100 (insufficient data).
+    """
     lab = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     l, a, b = cv2.split(lab)
-    
+
+    if mask is not None:
+        l = l[mask]
+        a = a[mask]
+        b = b[mask]
+        if l.size < 100:
+            raise ValueError(f"Insufficient tissue pixels: {l.size} < 100")
+
     l_mean, l_std = l.mean(), l.std()
     a_mean, a_std = a.mean(), a.std()
     b_mean, b_std = b.mean(), b.std()
-    
+
     return (l_mean, a_mean, b_mean), (l_std, a_std, b_std)
 
-def apply_reinhard(source_bgr, target_means, target_stds):
-    """Aplica la fórmula matemática de Reinhard a una imagen"""
-    source_means, source_stds = get_lab_stats(source_bgr)
+def apply_reinhard(
+    source_bgr: np.ndarray,
+    target_means: Tuple[float, float, float],
+    target_stds: Tuple[float, float, float],
+    tissue_mask: Optional[np.ndarray] = None,
+    bg_l_threshold: int = 230,
+    min_saturation: int = 10
+) -> np.ndarray:
+    """
+    Apply Reinhard stain normalization to tissue only; preserve white background.
+
+    Args:
+        source_bgr: Input BGR image
+        target_means: Tuple (l_mean, a_mean, b_mean) from reference
+        target_stds: Tuple (l_std, a_std, b_std) from reference
+        tissue_mask: Pre-computed tissue mask (optional; computed if not provided)
+        bg_l_threshold: L channel threshold for background detection (0–255)
+        min_saturation: Minimum HSV saturation for tissue
+
+    Returns:
+        Normalized image with original background pixels restored.
+    """
+    if tissue_mask is None:
+        tissue_mask = get_tissue_mask(source_bgr, bg_l_threshold, min_saturation)
+    source_means, source_stds = get_lab_stats(source_bgr, mask=tissue_mask)
 
     lab = cv2.cvtColor(source_bgr, cv2.COLOR_BGR2LAB).astype(np.float32)
     l, a, b = cv2.split(lab)
@@ -83,21 +151,170 @@ def apply_reinhard(source_bgr, target_means, target_stds):
     a = np.clip(a, 0, 255)
     b = np.clip(b, 0, 255)
 
-    lab_normalized = cv2.merge((l, a, b)).astype(np.uint8)
-    return cv2.cvtColor(lab_normalized, cv2.COLOR_LAB2BGR)
+    lab_out = cv2.merge((l, a, b)).astype(np.uint8)
+    result = cv2.cvtColor(lab_out, cv2.COLOR_LAB2BGR)
+
+    result[~tissue_mask] = source_bgr[~tissue_mask]
+    return result
 
 
-def _normalize_single_tile(args):
+def compute_template_from_tiles(tile_paths: list[str], bg_l_threshold: int = 230, min_saturation: int = 10) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+    """
+    Compute template statistics from a specific list of tile paths.
+
+    Args:
+        tile_paths: List of tile file paths
+        bg_l_threshold: L channel threshold for background
+        min_saturation: Minimum HSV saturation for tissue
+
+    Returns:
+        ((l_mean, a_mean, b_mean), (l_std, a_std, b_std)) — medians across samples
+    """
+    logger.info(f"Computing template from {len(tile_paths)} specific tiles...")
+
+    all_means, all_stds = [], []
+    for i, tile_path in enumerate(tile_paths, 1):
+        img = leer_imagen(str(tile_path))
+        if img is None:
+            logger.warning(f"  Failed to read: {Path(tile_path).name}")
+            continue
+
+        mask = get_tissue_mask(img, bg_l_threshold, min_saturation)
+        try:
+            m, s = get_lab_stats(img, mask=mask)
+            all_means.append(m)
+            all_stds.append(s)
+            logger.debug(f"  Tile {i}/{len(tile_paths)}: L={m[0]:.1f}±{s[0]:.1f}")
+        except ValueError:
+            logger.warning(f"  Insufficient tissue in: {Path(tile_path).name}")
+            continue
+
+    if len(all_means) < 5:
+        raise ValueError(f"Only {len(all_means)} valid tiles found; need at least 5")
+
+    target_means = tuple(np.median([m[i] for m in all_means]) for i in range(3))
+    target_stds = tuple(np.median([s[i] for s in all_stds]) for i in range(3))
+
+    logger.info(f"Template (median of {len(all_means)} tiles): L={target_means[0]:.1f}±{target_stds[0]:.1f}, a={target_means[1]:.1f}±{target_stds[1]:.1f}, b={target_means[2]:.1f}±{target_stds[2]:.1f}")
+    return target_means, target_stds
+
+
+def build_template_from_tiles(input_dir: str, n_samples: int = 200, bg_l_threshold: int = 230, min_saturation: int = 10) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+    """
+    Build robust template statistics from random sample of tiles.
+
+    Args:
+        input_dir: Directory to search for tiles (recursive)
+        n_samples: Number of tiles to sample (default 200)
+        bg_l_threshold: L channel threshold for background
+        min_saturation: Minimum HSV saturation for tissue
+
+    Returns:
+        ((l_mean, a_mean, b_mean), (l_std, a_std, b_std)) — medians across samples
+
+    Raises:
+        ValueError: If insufficient valid tiles found.
+    """
+    input_path = Path(input_dir)
+    candidates = [
+        p for p in input_path.rglob('*')
+        if p.suffix.lower() in {'.png', '.jpg', '.jpeg'}
+    ]
+
+    if not candidates:
+        raise ValueError(f"No tiles found in {input_dir}")
+
+    chosen = random.sample(candidates, min(n_samples, len(candidates)))
+    logger.info(f"Building template: sampling {len(chosen)} tiles from {input_dir}...")
+
+    all_means, all_stds = [], []
+    for i, tile_path in enumerate(chosen, 1):
+        img = leer_imagen(str(tile_path))
+        if img is None:
+            continue
+
+        mask = get_tissue_mask(img, bg_l_threshold, min_saturation)
+        try:
+            m, s = get_lab_stats(img, mask=mask)
+            all_means.append(m)
+            all_stds.append(s)
+            if i % 50 == 0:
+                logger.debug(f"  Sampled {i}/{len(chosen)} tiles")
+        except ValueError:
+            continue
+
+    if len(all_means) < 10:
+        raise ValueError(f"Only {len(all_means)} valid tiles found; need at least 10")
+
+    target_means = tuple(np.median([m[i] for m in all_means]) for i in range(3))
+    target_stds = tuple(np.median([s[i] for s in all_stds]) for i in range(3))
+
+    logger.info(f"Template (median of {len(all_means)} tiles): L={target_means[0]:.1f}±{target_stds[0]:.1f}, a={target_means[1]:.1f}±{target_stds[1]:.1f}, b={target_means[2]:.1f}±{target_stds[2]:.1f}")
+    return target_means, target_stds
+
+
+def load_or_build_template(input_dir: str, template_stats_file: Optional[str] = None, rebuild: bool = False, bg_l_threshold: int = 230, min_saturation: int = 10) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+    """
+    Load cached template statistics or build from sample tiles.
+
+    Args:
+        input_dir: Directory with tiles (used to build template if needed)
+        template_stats_file: Path to cached JSON file (default: .normalizacion/template_stats.json)
+        rebuild: If True, force rebuild from tiles (ignore cache)
+        bg_l_threshold: L channel threshold for background
+        min_saturation: Minimum HSV saturation for tissue
+
+    Returns:
+        ((l_mean, a_mean, b_mean), (l_std, a_std, b_std))
+    """
+    if template_stats_file is None:
+        template_stats_file = Path(input_dir).parent / ".normalizacion" / "template_stats.json"
+
+    template_stats_file = Path(template_stats_file)
+
+    if template_stats_file.exists() and not rebuild:
+        try:
+            with open(template_stats_file, 'r') as f:
+                data = json.load(f)
+                target_means = tuple(data['means'])
+                target_stds = tuple(data['stds'])
+                logger.info(f"Loaded cached template from {template_stats_file}")
+                logger.info(f"Template (cached): L={target_means[0]:.1f}±{target_stds[0]:.1f}, a={target_means[1]:.1f}±{target_stds[1]:.1f}, b={target_means[2]:.1f}±{target_stds[2]:.1f}")
+                return target_means, target_stds
+        except Exception as e:
+            logger.warning(f"Failed to load template cache: {e}; rebuilding...")
+
+    # Build from tiles
+    target_means, target_stds = build_template_from_tiles(input_dir, n_samples=200, bg_l_threshold=bg_l_threshold, min_saturation=min_saturation)
+
+    # Cache for future runs
+    try:
+        template_stats_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(template_stats_file, 'w') as f:
+            json.dump({
+                'means': list(target_means),
+                'stds': list(target_stds),
+                'n_samples': 200
+            }, f, indent=2)
+        logger.info(f"Cached template to {template_stats_file}")
+    except Exception as e:
+        logger.warning(f"Could not cache template: {e}")
+
+    return target_means, target_stds
+
+
+def _normalize_single_tile(args: tuple) -> Optional[str]:
     """
     Normalize a single tile using Reinhard stain normalization.
 
     Args:
-        args: Tuple of (source_path, output_path, target_means, target_stds)
+        args: Tuple of (source_path, output_path, target_means, target_stds,
+                        min_tissue_ratio, bg_l_threshold, min_saturation)
 
     Returns:
-        str: source_path if successful, None if failed.
+        str: "success", "skipped", or None on error.
     """
-    source_path, output_path, target_means, target_stds = args
+    source_path, output_path, target_means, target_stds, min_tissue_ratio, bg_l_threshold, min_saturation = args
 
     try:
         img = leer_imagen(source_path)
@@ -105,77 +322,120 @@ def _normalize_single_tile(args):
             logger.warning(f"Failed to read: {source_path}")
             return None
 
-        norm_img = apply_reinhard(img, target_means, target_stds)
-        guardar_imagen(output_path, norm_img)
-        return str(source_path)
+        tissue_mask = get_tissue_mask(img, bg_l_threshold, min_saturation)
+        tissue_ratio = tissue_mask.sum() / tissue_mask.size
 
+        if tissue_ratio < min_tissue_ratio:
+            logger.debug(f"Skipped {Path(source_path).name}: tissue_ratio={tissue_ratio:.2%} < {min_tissue_ratio:.2%}")
+            return "skipped"
+
+        norm_img = apply_reinhard(img, target_means, target_stds, tissue_mask=tissue_mask, bg_l_threshold=bg_l_threshold, min_saturation=min_saturation)
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        guardar_imagen(output_path, norm_img)
+        return "success"
+
+    except ValueError as e:
+        logger.debug(f"Skipped {Path(source_path).name}: {e}")
+        return "skipped"
     except Exception as e:
         logger.error(f"Error normalizing {source_path}: {e}", exc_info=True)
         return None
 
 
-def process_folder(input_dir, output_dir, template_path, num_workers=None):
+def process_folder(input_dir: str, output_dir: str, template_path: Optional[str] = None, template_tiles: Optional[list[str]] = None, num_workers: Optional[int] = None, tile_size: int = 1024,
+                   min_tissue_ratio: float = 0.05, bg_l_threshold: int = 230, min_saturation: int = 10, rebuild_template: bool = False) -> None:
     """
-    Normalize tiles using Reinhard stain normalization with parallel processing.
+    Recursively normalize tiles using Reinhard stain normalization with parallel processing.
 
     Args:
-        input_dir: Directory containing input tiles
-        output_dir: Directory for output normalized tiles
-        template_path: Path to reference template image
+        input_dir: Root directory (recursively searches for tiles)
+        output_dir: Directory for output normalized tiles (mirrors folder structure)
+        template_path: Path to reference template image (optional)
+        template_tiles: List of specific tile paths to build template from (optional)
         num_workers: Number of parallel workers (None = auto-calculate based on RAM)
+        tile_size: Tile size hint for RAM estimation (default 1024)
+        min_tissue_ratio: Skip tiles with tissue < this ratio (default 0.05)
+        bg_l_threshold: L channel threshold for background (default 230)
+        min_saturation: Minimum HSV saturation for tissue (default 10)
+        rebuild_template: If True, force rebuild template from tiles (ignore cache)
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Loading reference template...")
-    template_img = leer_imagen(template_path)
-    if template_img is None:
-        logger.error(f"Failed to load template: {template_path}")
+    try:
+        if template_path and Path(template_path).is_file():
+            # Single template image provided
+            logger.info(f"Using single template image: {template_path}")
+            template_img = leer_imagen(template_path)
+            if template_img is None:
+                raise ValueError(f"Failed to read template image: {template_path}")
+            mask = get_tissue_mask(template_img, bg_l_threshold, min_saturation)
+            target_means, target_stds = get_lab_stats(template_img, mask=mask)
+            logger.info(f"Template: L={target_means[0]:.1f}±{target_stds[0]:.1f}, a={target_means[1]:.1f}±{target_stds[1]:.1f}, b={target_means[2]:.1f}±{target_stds[2]:.1f}")
+        elif template_tiles:
+            # Use specific representative tiles
+            target_means, target_stds = compute_template_from_tiles(template_tiles, bg_l_threshold=bg_l_threshold, min_saturation=min_saturation)
+        else:
+            # Auto-build from tiles (cached)
+            target_means, target_stds = load_or_build_template(
+                input_dir,
+                template_stats_file=Path(input_dir).parent / ".normalizacion" / "template_stats.json",
+                rebuild=rebuild_template,
+                bg_l_threshold=bg_l_threshold,
+                min_saturation=min_saturation
+            )
+    except ValueError as e:
+        logger.error(f"Failed to load template: {e}")
         return
 
-    target_means, target_stds = get_lab_stats(template_img)
-    logger.info(f"Template analyzed successfully.\n")
-
-    # Only accept PNG/JPG (small tiles)
     valid_extensions = {'.png', '.jpg', '.jpeg'}
-    archivos = [f for f in os.listdir(input_dir) if os.path.splitext(f)[1].lower() in valid_extensions]
+    input_path = Path(input_dir)
 
-    if not archivos:
-        logger.warning(f"No tiles (.png or .jpg) found in: {input_dir}")
+    # Recursive search for tiles, preserving folder structure
+    tile_paths = [
+        p for p in input_path.rglob('*')
+        if p.suffix.lower() in valid_extensions
+    ]
+
+    if not tile_paths:
+        logger.warning(f"No tiles (.png/.jpg/.jpeg) found in: {input_dir}")
         return
 
-    logger.info(f"Found {len(archivos)} tile(s) to normalize")
+    logger.info(f"Found {len(tile_paths)} tile(s) to process recursively\n")
 
     # Sort by file size (descending) for load balancing
-    tile_paths = [os.path.join(input_dir, f) for f in archivos]
-    tile_paths.sort(key=lambda p: os.path.getsize(p) if os.path.exists(p) else 0, reverse=True)
-    archivos = [os.path.basename(p) for p in tile_paths]
+    tile_paths.sort(key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
 
     # Calculate num_workers if not provided
     if num_workers is None:
-        num_workers = _safe_worker_count(tile_paths)
+        num_workers = _safe_worker_count(tile_size_hint=tile_size)
 
-    # Build task list for multiprocessing
-    tasks = [
-        (os.path.join(input_dir, file_name),
-         os.path.join(output_dir, file_name),
-         target_means,
-         target_stds)
-        for file_name in archivos
-    ]
+    # Build task list: preserve folder structure in output
+    tasks = []
+    for tile_path in tile_paths:
+        rel_path = tile_path.relative_to(input_path)
+        output_path = Path(output_dir) / rel_path
+        tasks.append((str(tile_path), str(output_path), target_means, target_stds, min_tissue_ratio, bg_l_threshold, min_saturation))
 
-    logger.info(f"Starting parallel normalization with {num_workers} workers...")
+    logger.info(f"Starting parallel normalization with {num_workers} workers...\n")
     start_time = time.time()
 
-    # Process tiles in parallel
+    success_count = 0
+    skip_count = 0
+
     with Pool(processes=num_workers) as pool:
         for i, result in enumerate(pool.imap_unordered(_normalize_single_tile, tasks, chunksize=10), 1):
-            if result:
-                logger.info(f"Tile {i}/{len(tasks)} completed")
+            if result == "success":
+                success_count += 1
+                if i % 100 == 0:
+                    logger.info(f"Tile {i}/{len(tasks)} completed ({success_count} success, {skip_count} skipped)")
+            elif result == "skipped":
+                skip_count += 1
             else:
                 logger.warning(f"Tile {i}/{len(tasks)} failed")
 
     elapsed = time.time() - start_time
-    logger.info(f"Complete! {len(archivos)} tiles normalized in {elapsed:.2f}s")
+    logger.info(f"\nComplete! {success_count}/{len(tasks)} tiles normalized, {skip_count} skipped in {elapsed:.2f}s")
 
 if __name__ == "__main__":
     import argparse
@@ -184,25 +444,35 @@ if __name__ == "__main__":
     base_dir = Path("/Users/olivera/Documents/Proyecto_Final_Glomerulos/Salidas/Imagen")
     default_input = str(base_dir)
     default_output = str(base_dir.parent / "Normalizados")
-    default_template = "/Users/olivera/Documents/Proyecto_Final_Glomerulos/referencia_reinhard.png"
+
+    # Default template references — reads all images from referencias/ folder
+    referencias_dir = Path("referencias")
+    if referencias_dir.exists():
+        default_template_tiles = sorted([
+            str(p) for p in referencias_dir.glob('*')
+            if p.suffix.lower() in {'.png', '.jpg', '.jpeg'}
+        ])
+    else:
+        default_template_tiles = []
 
     parser = argparse.ArgumentParser(
         description="Normalización de Reinhard para tiles histopatológicos",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-Uso por defecto (sin argumentos):
+Uso por defecto (sin argumentos — usa 24 tiles representativos como template):
   python3 normalizacion.py
 
 Rutas por defecto:
   --input    """ + default_input + """
   --output   """ + default_output + """
-  --template """ + default_template + """
 
 Uso personalizado:
   python3 normalizacion.py \\
     --input /ruta/a/tiles \\
     --output /ruta/salida \\
-    --template /ruta/referencia.png
+    --template /ruta/referencia.png \\
+    --workers 4 \\
+    --min_tissue_ratio 0.1
         """
     )
 
@@ -218,8 +488,8 @@ Uso personalizado:
     )
     parser.add_argument(
         "--template",
-        default=default_template,
-        help=f"Ruta al tile de referencia (default: {default_template})"
+        default=None,
+        help="Ruta a imagen de referencia única (opcional; por defecto: tiles representativos)"
     )
     parser.add_argument(
         "--workers",
@@ -227,6 +497,46 @@ Uso personalizado:
         default=None,
         help="Número de workers paralelos (default: auto-calcula basado en RAM)"
     )
+    parser.add_argument(
+        "--tile_size",
+        type=int,
+        default=1024,
+        help="Tamaño de tile para estimación de RAM (default: 1024)"
+    )
+    parser.add_argument(
+        "--min_tissue_ratio",
+        type=float,
+        default=0.05,
+        help="Omitir tiles con tejido < este ratio (default: 0.05 = 5%%)"
+    )
+    parser.add_argument(
+        "--bg_l_threshold",
+        type=int,
+        default=230,
+        help="Umbral de canal L para detectar fondo blanco (0-255, default: 230)"
+    )
+    parser.add_argument(
+        "--min_saturation",
+        type=int,
+        default=10,
+        help="Saturación mínima HSV para detectar tejido (0-255, default: 10)"
+    )
+    parser.add_argument(
+        "--rebuild-template",
+        action="store_true",
+        help="Recalcular template desde tiles (ignora cache)"
+    )
 
     args = parser.parse_args()
-    process_folder(args.input, args.output, args.template, num_workers=args.workers)
+    process_folder(
+        args.input,
+        args.output,
+        template_path=args.template,
+        template_tiles=default_template_tiles,
+        num_workers=args.workers,
+        tile_size=args.tile_size,
+        min_tissue_ratio=args.min_tissue_ratio,
+        bg_l_threshold=args.bg_l_threshold,
+        min_saturation=args.min_saturation,
+        rebuild_template=args.rebuild_template
+    )
