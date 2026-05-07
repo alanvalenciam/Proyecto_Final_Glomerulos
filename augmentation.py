@@ -29,10 +29,6 @@ from tqdm import tqdm
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# Configuration
-# ============================================================================
-
 TARGET_ESCLEROSADO = 0.20
 TARGET_EXCLUIDO = 0.15
 
@@ -40,7 +36,6 @@ MAX_AUGMENTATIONS_PER_ORIGINAL = 3
 PHASH_THRESHOLD = 3
 PIXEL_DIFF_THRESHOLD = 2 / 255.0
 
-# Class name mappings
 CLASS_NAMES = {
     'No_Proliferativo': 1,
     'Proliferativo': 2,
@@ -48,10 +43,6 @@ CLASS_NAMES = {
     'Excluido': 4,
 }
 
-
-# ============================================================================
-# Dataclasses
-# ============================================================================
 
 @dataclass
 class TileEntry:
@@ -74,13 +65,7 @@ class AugStats:
     discarded_pixdiff: int = 0
     discarded_io_error: int = 0
 
-
-# ============================================================================
-# Dependency check
-# ============================================================================
-
 def check_dependencies():
-    """Verify required packages."""
     missing = []
     try:
         import albumentations
@@ -98,12 +83,7 @@ def check_dependencies():
         sys.exit(1)
 
 
-# ============================================================================
-# Image I/O
-# ============================================================================
-
 def load_image(path: Path) -> Optional[np.ndarray]:
-    """Load RGB image."""
     try:
         img = cv2.imread(str(path), cv2.IMREAD_COLOR)
         if img is None:
@@ -115,7 +95,6 @@ def load_image(path: Path) -> Optional[np.ndarray]:
 
 
 def load_mask(path: Path) -> Optional[np.ndarray]:
-    """Load mask as uint8."""
     try:
         mask = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
         if mask is None:
@@ -129,30 +108,22 @@ def load_mask(path: Path) -> Optional[np.ndarray]:
 
 
 def save_image(img: np.ndarray, path: Path):
-    """Save RGB image."""
     path.parent.mkdir(parents=True, exist_ok=True)
     img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
     cv2.imwrite(str(path), img_bgr)
 
 
 def save_mask(mask: np.ndarray, path: Path):
-    """Save mask as uint8."""
     path.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(path), mask)
 
 
 def save_pair(img: np.ndarray, mask: np.ndarray, img_path: Path, mask_path: Path):
-    """Save image and mask together."""
     save_image(img, img_path)
     save_mask(mask, mask_path)
 
 
-# ============================================================================
-# Augmentation pipelines
-# ============================================================================
-
 def build_augmentation_pipeline() -> A.Compose:
-    """Random augmentation pipeline."""
     return A.Compose([
         A.HorizontalFlip(p=0.5),
         A.VerticalFlip(p=0.3),
@@ -169,7 +140,6 @@ def build_augmentation_pipeline() -> A.Compose:
     ], additional_targets={'mask': 'mask'})
 
 
-# Deterministic transforms for Component A
 DETERMINISTIC_TRANSFORMS = {
     'hflip': lambda x: np.fliplr(x),
     'vflip': lambda x: np.flipud(x),
@@ -180,12 +150,7 @@ DETERMINISTIC_TRANSFORMS = {
 }
 
 
-# ============================================================================
-# Dataset scanning
-# ============================================================================
-
 def scan_dataset(tiles_root: Path) -> Tuple[List[TileEntry], Dict[str, List[TileEntry]]]:
-    """Scan dataset and build catalogs."""
     catalog_a = []
     catalog_b = {'Esclerosado': [], 'Excluido': []}
 
@@ -205,7 +170,6 @@ def scan_dataset(tiles_root: Path) -> Tuple[List[TileEntry], Dict[str, List[Tile
             logger.error(f"Error reading {annotations_path}: {e}")
             continue
 
-        # Scan tiles
         for tile_info in data.get('tiles', []):
             if not tile_info.get('has_annotations'):
                 continue
@@ -231,10 +195,8 @@ def scan_dataset(tiles_root: Path) -> Tuple[List[TileEntry], Dict[str, List[Tile
                 tile_info=tile_info,
             )
 
-            # Catalog A: all annotated tiles
             catalog_a.append(entry)
 
-            # Catalog B: pure tiles for minority classes
             if classes == {'Esclerosado'}:
                 catalog_b['Esclerosado'].append(entry)
             elif classes == {'Excluido'}:
@@ -244,7 +206,6 @@ def scan_dataset(tiles_root: Path) -> Tuple[List[TileEntry], Dict[str, List[Tile
 
 
 def count_glomeruli_by_class(tiles_root: Path) -> Dict[str, int]:
-    """Count total glomeruli by class across all biopsias."""
     counts = {cls: 0 for cls in CLASS_NAMES.keys()}
 
     for biopsia_dir in tiles_root.iterdir():
@@ -270,9 +231,18 @@ def count_glomeruli_by_class(tiles_root: Path) -> Dict[str, int]:
     return counts
 
 
-# ============================================================================
-# Update annotations.json with augmented tiles
-# ============================================================================
+def build_augmented_tile_info(tile_info: dict, source_transform: str) -> dict:
+    """Build tile_info for augmented tiles, preserving valid fields and removing invalid ones."""
+    return {
+        'type': 'augmented',
+        'image': tile_info['image'],
+        'mask': tile_info['mask'],
+        'origin_native': tile_info['origin_native'],
+        'has_annotations': tile_info['has_annotations'],
+        'glomeruli': [dict(g) for g in tile_info.get('glomeruli', [])],
+        'source_transform': source_transform,
+    }
+
 
 def update_annotations_json(output_root: Path, augmented_entries: Dict[str, List[dict]]):
     """Add augmented tile entries to annotations.json for each biopsia."""
@@ -298,10 +268,6 @@ def update_annotations_json(output_root: Path, augmented_entries: Dict[str, List
         except Exception as e:
             logger.error(f"Error updating annotations.json for {biopsia}: {e}")
 
-
-# ============================================================================
-# Component A: General augmentation
-# ============================================================================
 
 def run_general_augmentation(
     catalog_a: List[TileEntry],
@@ -329,7 +295,6 @@ def run_general_augmentation(
 
         output_dir = output_root / entry.biopsia
 
-        # Log original
         tile_log.append({
             'stem': entry.stem,
             'biopsia': entry.biopsia,
@@ -338,11 +303,9 @@ def run_general_augmentation(
             'mask_path': str(entry.mask_path),
         })
 
-        # Initialize augmented_entries for this biopsia if needed
         if entry.biopsia not in augmented_entries:
             augmented_entries[entry.biopsia] = []
 
-        # Apply deterministic transforms
         for transform_name, transform_fn in DETERMINISTIC_TRANSFORMS.items():
             try:
                 if img.ndim == 3:
@@ -352,7 +315,6 @@ def run_general_augmentation(
 
                 aug_mask = transform_fn(mask)
 
-                # Verify mask integrity
                 unique_vals = set(np.unique(aug_mask))
                 if not unique_vals.issubset({0, 255}):
                     logger.warning(f"Invalid mask values: {unique_vals}")
@@ -363,9 +325,7 @@ def run_general_augmentation(
                     mask_out = output_dir / 'masks' / f"{entry.stem}_{transform_name}_mask.png"
                     save_pair(aug_img, aug_mask, img_out, mask_out)
 
-                    # Add augmented entry to annotations
-                    aug_tile = dict(entry.tile_info)
-                    aug_tile['type'] = 'augmented'
+                    aug_tile = build_augmented_tile_info(entry.tile_info, transform_name)
                     aug_tile['image'] = f"images/{entry.stem}_{transform_name}.png"
                     aug_tile['mask'] = f"masks/{entry.stem}_{transform_name}_mask.png"
                     augmented_entries[entry.biopsia].append(aug_tile)
@@ -378,10 +338,6 @@ def run_general_augmentation(
     logger.info(f"Component A: Generated {generated} new pairs, logged {len(tile_log)} originals")
     return generated, tile_log, augmented_entries
 
-
-# ============================================================================
-# Analysis: Calculate synthetic targets
-# ============================================================================
 
 def calculate_synthetic_targets(
     glomeruli_original: Dict[str, int],
@@ -433,10 +389,6 @@ def calculate_synthetic_targets(
     return targets, glomeruli_after_A
 
 
-# ============================================================================
-# Component B: Synthetic generation
-# ============================================================================
-
 def run_synthetic_generation(
     catalog_b: Dict[str, List[TileEntry]],
     output_root: Path,
@@ -476,7 +428,6 @@ def run_synthetic_generation(
         generated = 0
         aug_count_per_original = {}
 
-        # Initialize augmented_entries dict for each biopsia in candidates
         for entry in candidates:
             if entry.biopsia not in augmented_entries:
                 augmented_entries[entry.biopsia] = []
@@ -511,7 +462,6 @@ def run_synthetic_generation(
                 s.discarded_io_error += 1
                 continue
 
-            # Initialize counter if not already set from disk scan
             if entry.stem not in aug_count_per_original:
                 aug_count_per_original[entry.stem] = 0
             orig_phash = imagehash.phash(Image.fromarray(img))
@@ -524,30 +474,25 @@ def run_synthetic_generation(
                     break
 
                 try:
-                    # Apply random augmentation
                     result = pipeline(image=img, mask=mask)
                     aug_img = result['image']
                     aug_mask = result['mask']
 
-                    # Verify mask values
                     unique_vals = set(np.unique(aug_mask))
                     if not unique_vals.issubset({0, 255}):
                         continue
 
-                    # Deduplication: pixel diff
                     pixel_diff = np.mean(np.abs(aug_img.astype(float) - img.astype(float))) / 255.0
                     if pixel_diff < pixel_threshold:
                         s.discarded_pixdiff += 1
                         continue
 
-                    # Deduplication: pHash
                     aug_phash = imagehash.phash(Image.fromarray(aug_img))
                     hamming_dist = orig_phash - aug_phash
                     if hamming_dist <= hash_threshold:
                         s.discarded_phash += 1
                         continue
 
-                    # Save
                     N = aug_count_per_original[entry.stem] + 1
                     aug_stem = f"{entry.stem}_aug{N}"
 
@@ -557,9 +502,7 @@ def run_synthetic_generation(
                         mask_out = output_dir / 'masks' / f"{aug_stem}_mask.png"
                         save_pair(aug_img, aug_mask, img_out, mask_out)
 
-                        # Add augmented entry to annotations
-                        aug_tile = dict(entry.tile_info)
-                        aug_tile['type'] = 'augmented'
+                        aug_tile = build_augmented_tile_info(entry.tile_info, 'random_augmentation')
                         aug_tile['image'] = f"images/{aug_stem}.png"
                         aug_tile['mask'] = f"masks/{aug_stem}_mask.png"
                         augmented_entries[entry.biopsia].append(aug_tile)
@@ -576,12 +519,7 @@ def run_synthetic_generation(
     return stats, augmented_entries
 
 
-# ============================================================================
-# Copy base dataset
-# ============================================================================
-
 def copy_base_dataset(src_root: Path, dst_root: Path, overwrite: bool = False) -> int:
-    """Copy base dataset to output directory."""
     logger.info(f"Copying base dataset: {src_root} → {dst_root}")
 
     if dst_root.exists() and overwrite:
@@ -606,21 +544,18 @@ def copy_base_dataset(src_root: Path, dst_root: Path, overwrite: bool = False) -
         images_dst.mkdir(parents=True, exist_ok=True)
         masks_dst.mkdir(parents=True, exist_ok=True)
 
-        # Copy images
         for img_file in images_src.glob('*.png'):
             dst_file = images_dst / img_file.name
             if not dst_file.exists():
                 shutil.copy2(img_file, dst_file)
                 pair_count += 1
 
-        # Copy masks
         if masks_src.exists():
             for mask_file in masks_src.glob('*.png'):
                 dst_file = masks_dst / mask_file.name
                 if not dst_file.exists():
                     shutil.copy2(mask_file, dst_file)
 
-        # Copy annotations.json
         annotations_src = biopsia_dir / 'annotations.json'
         if annotations_src.exists():
             annotations_dst = dst_root / biopsia_dir.name / 'annotations.json'
@@ -629,10 +564,6 @@ def copy_base_dataset(src_root: Path, dst_root: Path, overwrite: bool = False) -
     logger.info(f"Base dataset copied: {pair_count} pairs")
     return pair_count
 
-
-# ============================================================================
-# Reporting
-# ============================================================================
 
 def print_report(
     n_base: int,
@@ -714,10 +645,6 @@ def print_report(
     print("=" * 80 + "\n")
 
 
-# ============================================================================
-# Main
-# ============================================================================
-
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -750,7 +677,6 @@ def main():
 
     args = parser.parse_args()
 
-    # Setup logging
     level = logging.DEBUG if args.verbose else logging.INFO
     logging.basicConfig(
         level=level,
@@ -768,19 +694,16 @@ def main():
     if args.dry_run:
         logger.info("DRY RUN MODE - no files will be written")
 
-    # Scan dataset
     logger.info("Scanning dataset...")
     catalog_a, catalog_b = scan_dataset(args.tiles_dir)
     logger.info(f"Found {len(catalog_a)} annotated tiles")
     logger.info(f"Found {len(catalog_b['Esclerosado'])} pure Esclerosado tiles")
     logger.info(f"Found {len(catalog_b['Excluido'])} pure Excluido tiles")
 
-    # Count glomeruli
     logger.info("Counting glomeruli by class...")
     glomeruli_original = count_glomeruli_by_class(args.tiles_dir)
     logger.info(f"Original distribution: {glomeruli_original}")
 
-    # Calculate synthetic targets
     synthetic_targets, glomeruli_after_a = calculate_synthetic_targets(
         glomeruli_original,
         TARGET_ESCLEROSADO,
@@ -790,20 +713,16 @@ def main():
     logger.info(f"Synthetic targets needed: {synthetic_targets}")
     logger.info(f"Glomeruli after Component A: {glomeruli_after_a}")
 
-    # Copy base dataset
     n_base = copy_base_dataset(args.tiles_dir, output_root, overwrite=args.overwrite)
 
-    # Component A: General augmentation
     n_general, tile_log, augmented_a = run_general_augmentation(catalog_a, output_root, dry_run=args.dry_run)
 
-    # Save tile log
     if not args.dry_run:
         log_path = output_root / 'tile_originals.json'
         with open(log_path, 'w') as f:
             json.dump({'tiles': tile_log}, f, indent=2)
         logger.info(f"Saved tile log: {log_path}")
 
-    # Component B: Synthetic generation
     pipeline = build_augmentation_pipeline()
     stats_b, augmented_b = run_synthetic_generation(
         catalog_b,
@@ -816,7 +735,6 @@ def main():
         dry_run=args.dry_run,
     )
 
-    # Merge augmented entries from both components and update annotations
     all_augmented = {}
     for biopsia, tiles in augmented_a.items():
         all_augmented.setdefault(biopsia, []).extend(tiles)
@@ -826,14 +744,12 @@ def main():
     if not args.dry_run and all_augmented:
         update_annotations_json(output_root, all_augmented)
 
-    # Calculate final distribution (start from post-A state)
     glomeruli_final = dict(glomeruli_after_a)
     for class_name in ['Esclerosado', 'Excluido']:
         s = stats_b.get(class_name)
         if s:
             glomeruli_final[class_name] += s.generated
 
-    # Report
     print_report(
         n_base,
         n_general,
