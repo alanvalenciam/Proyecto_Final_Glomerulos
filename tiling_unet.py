@@ -64,6 +64,16 @@ COMPRESSION = 0
 
 LARGE_FILE_THRESHOLD = 300 * 1024 * 1024  # 300 MB
 
+# Explicit class priority for mask overlaps (higher = higher priority)
+# When polygons overlap, the class with the highest priority wins
+CLASS_PRIORITY = {
+    0: 0,      # background (lowest priority)
+    1: 10,     # No_Proliferativo
+    2: 8,      # Proliferativo
+    3: 5,      # Esclerosado
+    4: 1,      # Excluido (lowest priority despite highest class_id)
+}
+
 # Class mapping — CANONICAL and FIXED (deterministic)
 CANONICAL_CLASS_MAP = {
     'background':       0,
@@ -161,7 +171,7 @@ def normalize_class_name(raw: str) -> str:
     logger.warning(f"Unknown class name '{raw}', using as-is")
     return raw
 
-def estimate_memory(tiff_path: str, expansion_factor: float = 2.0) -> float:
+def estimate_memory(tiff_path: str, expansion_factor: float = 5.0) -> float:
     """Estimate RAM needed to process a TIFF file (in GB)."""
     file_size_gb = os.path.getsize(tiff_path) / (1024**3)
     return file_size_gb * expansion_factor
@@ -315,7 +325,6 @@ def compute_polygon_centroid(polygon_coords: List[List[float]]) -> Tuple[float, 
 def rasterize_polygon(
     polygon_coords: List[List[float]],
     tile_box: Tuple[int, int, int, int],
-    class_id: int,
     tile_size: int = TILE_SIZE
 ) -> np.ndarray:
     """
@@ -452,6 +461,47 @@ def compute_coverage(
         logger.warning(f"Failed to compute coverage: {e}")
         return 0.0
 
+def combine_masks_with_priority(
+    current_mask: np.ndarray,
+    new_mask: np.ndarray,
+    new_class_id: int
+) -> np.ndarray:
+    """
+    Combine two class masks using explicit priority-based logic.
+
+    When pixels overlap (both masks have non-zero values), the class with
+    the HIGHEST priority wins, not the highest class_id.
+
+    Args:
+        current_mask: Current combined mask (uint8, 0=background, 1+=class_id)
+        new_mask: New glomerulus mask (uint8, contains 0 or class_id value)
+        new_class_id: The class ID being added (used for pixels where new_mask > 0)
+
+    Returns:
+        Combined mask with priority-based pixel selection
+    """
+    result = current_mask.copy()
+
+    # Find pixels where new_mask has annotation (non-zero)
+    new_pixels = new_mask > 0
+
+    # For each annotated pixel in new_mask, decide which class wins
+    current_class_ids = result[new_pixels]
+    new_priority = CLASS_PRIORITY.get(new_class_id, 0)
+
+    # Create mask of pixels where new class has higher priority
+    # For background (0), treat priority as 0
+    for idx_flat in np.where(new_pixels.ravel())[0]:
+        row, col = np.unravel_index(idx_flat, new_pixels.shape)
+        current_class_id = result[row, col]
+        current_priority = CLASS_PRIORITY.get(current_class_id, 0)
+
+        # New class wins if it has higher priority
+        if new_priority > current_priority:
+            result[row, col] = 255
+
+    return result
+
 # ============================================================================
 # Primary/Secondary tile assignment
 # ============================================================================
@@ -466,14 +516,19 @@ def compute_primary_secondary(
     Primary: tile with max coverage (if ≥threshold) or centered tile (if created)
     Secondary: tile with next max coverage
 
+    IMPORTANT: For centered tiles, primary_coverage is PLACEHOLDER (will be
+    calculated after the centered tile is actually created). See
+    update_coverage_for_centered_tile() to compute real coverage.
+
     Returns:
     {
         glom_id: {
-            'primary_tile_idx': int or 'centered',
+            'primary_tile_idx': int or None (None means centered tile needed),
             'secondary_tile_idx': int or None,
-            'primary_coverage': float,
+            'primary_coverage': float (real for grid, placeholder for centered),
             'secondary_coverage': float,
-            'primary_is_centered': bool
+            'primary_is_centered': bool,
+            'needs_centered_tile': bool
         }
     }
     """
@@ -512,15 +567,35 @@ def compute_primary_secondary(
             secondary_cov = coverages[0][1] if coverages else 0.0
 
             assignment[glom_id] = {
-                'primary_tile_idx': None,  # Will be 'centered' in output
+                'primary_tile_idx': None,  # Will trigger centered tile creation
                 'secondary_tile_idx': secondary_idx,
-                'primary_coverage': 100.0,  # Centered tile will contain it
+                'primary_coverage': 0.0,  # PLACEHOLDER — will be updated after centered tile created
                 'secondary_coverage': secondary_cov,
                 'primary_is_centered': True,
                 'needs_centered_tile': True
             }
 
     return assignment
+
+def update_coverage_for_centered_tile(
+    glom_id: int,
+    glom_coords: List[List[float]],
+    tile_box: Tuple[int, int, int, int],
+    assignment: Dict[int, Dict]
+) -> None:
+    """
+    Update primary_coverage for a glomerulus that needed a centered tile.
+    Call this AFTER the centered tile box is finalized.
+
+    Args:
+        glom_id: The glomerulus ID
+        glom_coords: The glomerulus polygon coordinates
+        tile_box: The centered tile's bounding box (x, y, x_end, y_end)
+        assignment: The assignments dict to update in-place
+    """
+    if glom_id in assignment and assignment[glom_id]['primary_is_centered']:
+        real_coverage = compute_coverage(glom_coords, tile_box)
+        assignment[glom_id]['primary_coverage'] = real_coverage
 
 # ============================================================================
 # Tile I/O
@@ -660,10 +735,10 @@ def process_slide_pair(
                     glom_mask = rasterize_polygon(
                         glom_data['coordinates'],
                         (x, y, x_end, y_end),
-                        glom_data['class_id'],
                         tile_size
                     )
-                    mask = np.maximum(mask, glom_mask)
+                    # Combine masks using explicit priority (not implicit np.maximum)
+                    mask = combine_masks_with_priority(mask, glom_mask, glom_data['class_id'])
 
                     role = 'primary' if assignments[glom_id]['primary_tile_idx'] == tile_idx else 'secondary'
                     tile_glomeruli.append({
@@ -719,6 +794,9 @@ def process_slide_pair(
             y = min(y, height - tile_size)
             x_end, y_end = x + tile_size, y + tile_size
 
+            # Calculate real coverage in the centered tile (not placeholder 0.0)
+            update_coverage_for_centered_tile(glom_id, glom_data['coordinates'], (x, y, x_end, y_end), assignments)
+
             tile_name = f"{stem}_centered_g{glom_id:04d}"
 
             # Extract tile image
@@ -737,10 +815,10 @@ def process_slide_pair(
                     glom_mask = rasterize_polygon(
                         gdata['coordinates'],
                         (x, y, x_end, y_end),
-                        gdata['class_id'],
                         tile_size
                     )
-                    mask = np.maximum(mask, glom_mask)
+                    # Combine masks using explicit priority (not implicit np.maximum)
+                    mask = combine_masks_with_priority(mask, glom_mask, gdata['class_id'])
 
                     role = 'primary' if gid == glom_id else 'secondary'
                     tile_glomeruli.append({

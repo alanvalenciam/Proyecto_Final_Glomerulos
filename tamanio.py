@@ -163,9 +163,14 @@ def _process_single_geojson(args) -> Tuple[str, List[Dict]]:
 
                 glomeruli_name = props.get("name", f"glomeruli_{idx+1}")
 
+                # Extraer clase del GeoJSON
+                classification = props.get("classification", {})
+                glomeruli_class = classification.get("name", "Unknown") if isinstance(classification, dict) else "Unknown"
+
                 rows.append({
                     "dataset": dataset_name,
                     "name": glomeruli_name,
+                    "class": glomeruli_class,
                     "area_native_px2": round(area, 2),
                     "width_native_px": round(width, 2),
                     "height_native_px": round(height, 2),
@@ -308,6 +313,10 @@ def analyze_glomeruli_sizes(geojson_path: str,
             # Nombre del glomérulo
             glomeruli_name = props.get("name", f"glomeruli_{idx+1}")
 
+            # Extraer clase del GeoJSON
+            classification = props.get("classification", {})
+            glomeruli_class = classification.get("name", "Unknown") if isinstance(classification, dict) else "Unknown"
+
             # Calcular valores en tile-space (lo que el modelo ve)
             area_tile = area * (zoom_scale ** 2)
             width_tile = width * zoom_scale
@@ -316,6 +325,7 @@ def analyze_glomeruli_sizes(geojson_path: str,
 
             rows.append({
                 "name": glomeruli_name,
+                "class": glomeruli_class,
                 "area_native_px2": round(area, 2),
                 "width_native_px": round(width, 2),
                 "height_native_px": round(height, 2),
@@ -423,7 +433,7 @@ def analyze_glomeruli_sizes(geojson_path: str,
 def _create_glomeruli_plots(df: pd.DataFrame,
                            stats: Dict,
                            output_dir: str):
-    """Crea 4 gráficos: histograma de áreas, scatter width vs height, histograma de circularidad, histograma de tamaño cuadrado."""
+    """Crea 5 gráficos: histograma de áreas, scatter width vs height, histograma de circularidad, histograma de tamaño cuadrado, y distribución de clases."""
     os.makedirs(output_dir, exist_ok=True)
 
     # 1. Histograma de áreas (tile-space)
@@ -509,6 +519,41 @@ def _create_glomeruli_plots(df: pd.DataFrame,
     plt.savefig(square_plot, dpi=150, bbox_inches="tight")
     plt.close()
     logger.info(f"Plot guardado: {square_plot}")
+
+    # 5. Gráfico de distribución de clases (pie chart)
+    if "class" in df.columns:
+        class_counts = df["class"].value_counts()
+        class_percentages = (class_counts / len(df)) * 100
+
+        plt.figure(figsize=(12, 7))
+        colors = plt.cm.Set3(range(len(class_counts)))
+        wedges, texts, autotexts = plt.pie(
+            class_counts.values,
+            labels=class_counts.index,
+            autopct='%1.1f%%',
+            colors=colors,
+            startangle=90,
+            textprops={'fontsize': 11}
+        )
+
+        # Mejorar estilo de porcentajes
+        for autotext in autotexts:
+            autotext.set_color('black')
+            autotext.set_fontweight('bold')
+            autotext.set_fontsize(11)
+
+        # Título y leyenda con conteos
+        plt.title("Distribution of Glomeruli by Class", fontsize=14, fontweight="bold", pad=20)
+
+        # Crear leyenda con conteos y porcentajes
+        legend_labels = [f"{cls}: {count} ({pct:.1f}%)"
+                        for cls, count, pct in zip(class_counts.index, class_counts.values, class_percentages)]
+        plt.legend(legend_labels, loc="best", fontsize=10, framealpha=0.9)
+
+        class_plot = os.path.join(output_dir, "05_class_distribution.png")
+        plt.savefig(class_plot, dpi=150, bbox_inches="tight")
+        plt.close()
+        logger.info(f"Plot guardado: {class_plot}")
 
 
 def _generate_tile_report(dataset_name: str, df: pd.DataFrame, stats: Dict, output_dir: str):

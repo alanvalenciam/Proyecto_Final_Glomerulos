@@ -132,7 +132,7 @@ def _safe_worker_count(tile_folders: List[str]) -> int:
         else:
             available_ram = 4 * 1024 * 1024 * 1024  # Conservative fallback: 4GB
 
-        safe_ram = available_ram * 0.7
+        safe_ram = available_ram * 0.5
 
         # Estimate max per-folder size
         max_folder_size = 0
@@ -437,7 +437,7 @@ def main():
         if batch_mode:
             batch_reconstruct(input_folder, output_path)
         else:
-            reconstruct_image(input_folder, output_path, verbose=True, max_size_mb=50)
+            reconstruct_image_internal(input_folder, output_path, verbose=True, max_size_mb=50)
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
         sys.exit(1)

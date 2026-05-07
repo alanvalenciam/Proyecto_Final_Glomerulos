@@ -379,7 +379,7 @@ def _process_single_image(args):
         return None
 
 
-def process_folder_to_subfolders(input_dir, output_dir, tile_size=1024, overlap=256,
+def process_folder_to_subfolders(input_dir, output_dir, tile_size=1024, overlap=512,
                                 target_mpp=0.5, zoom_scale=0.5, bg_threshold=15.0, output_format='png',
                                 openslide_level=0, format_filter=None, otsu_min_ratio=0.01, num_workers=None):
     """
@@ -464,7 +464,7 @@ if __name__ == "__main__":
         input_dir,
         output_dir,
         tile_size=1024,
-        overlap=256,           # 25% overlap for better tissue coverage
+        overlap=512,           # 25% overlap for better tissue coverage
         target_mpp=0.5,        # Standard resolution for OpenSlide (20x equivalent)
         zoom_scale=0.5,        # Downsampling for PIL (TIFF) — captures 4x more native pixels
         bg_threshold=15.0,     # Less aggressive filter for low-quality staining

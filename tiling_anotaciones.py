@@ -24,11 +24,12 @@ import os
 import json
 import logging
 import argparse
+import math
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+from multiprocessing import Pool, cpu_count
 from PIL import Image
 import numpy as np
-from multiprocessing import Pool, cpu_count
 from shapely.geometry import shape, box
 
 Image.MAX_IMAGE_PIXELS = None
@@ -52,15 +53,77 @@ try:
 except ImportError:
     OPENCV_AVAILABLE = False
 
+try:
+    import psutil
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+
 OPENSLIDE_FORMATS = {'.svs', '.ndpi', '.vms'}
 PIL_FORMATS = {'.tif', '.tiff', '.png', '.jpg', '.jpeg'}
+LARGE_FILE_THRESHOLD = 300 * 1024 * 1024  # 300MB (use OpenSlide for larger files to avoid memory issues)
+
+
+def calculate_safe_workers(tiff_paths: List[str], target_ram_percent: float = 0.5) -> int:
+    """
+    Calculate safe number of workers based on available RAM.
+
+    Args:
+        tiff_paths: list of TIFF file paths
+        target_ram_percent: use up to this % of available RAM (default 0.9 = 90%)
+
+    Returns:
+        Number of workers (1-4)
+    """
+    if not PSUTIL_AVAILABLE:
+        logger.info("psutil not available, using 2 workers by default")
+        return min(2, cpu_count())
+
+    try:
+        # Get available RAM
+        available_gb = psutil.virtual_memory().available / (1024**3)
+        target_gb = available_gb * target_ram_percent
+
+        # Estimate max file size
+        max_file_gb = 0.0
+        for path in tiff_paths:
+            if os.path.exists(path):
+                size_gb = os.path.getsize(path) / (1024**3)
+                max_file_gb = max(max_file_gb, size_gb)
+
+        if max_file_gb == 0:
+            max_file_gb = 0.5
+
+        # Each worker needs ~2x file size (decompressed TIFF, we resize early to minimize RAM)
+        memory_per_worker = max_file_gb * 2.0
+
+        if memory_per_worker > 0:
+            # Use ceil for aggressive packing (round up if > 0.5)
+            num_workers = math.ceil(target_gb / memory_per_worker)
+            num_workers = max(1, min(num_workers, 4))  # Cap at 4
+        else:
+            num_workers = 2
+
+        logger.info(
+            f"RAM calculation: {available_gb:.1f}GB available, "
+            f"max TIFF {max_file_gb:.2f}GB, "
+            f"targeting {target_ram_percent*100:.0f}% → {num_workers} workers"
+        )
+        return num_workers
+
+    except Exception as e:
+        logger.warning(f"Failed to calculate workers: {e}, using 2 by default")
+        return 2
 
 
 def detect_format(file_path: str) -> Optional[str]:
-    """Detect image format by extension."""
+    """Detect image format by extension. Always use PIL for large TIFF files (lazy loading)."""
     ext = os.path.splitext(file_path)[1].lower()
+
+    # Try OpenSlide first for native WSI formats
     if ext in OPENSLIDE_FORMATS and OPENSLIDE_AVAILABLE:
         return 'openslide'
+    # For TIFF/PNG/JPG, always use PIL (has lazy loading for large files)
     elif ext in PIL_FORMATS:
         return 'pil'
     return None
@@ -95,18 +158,19 @@ def load_image_metadata(image_path: str, fmt: str) -> Dict:
 def extract_crop_from_tiff(
     image_path: str,
     bbox: Tuple[float, float, float, float],
-    zoom_scale: float,
     output_size: int,
-    fmt: str
+    fmt: str,
+    max_intermediate_size: int = 2048
 ) -> Optional[Image.Image]:
     """
     Extract crop from TIFF and resize to output_size x output_size.
+    GeoJSON coordinates are always in level-0 (native) WSI space.
 
     Args:
-        bbox: (xmin, ymin, xmax, ymax) in WSI pixel coordinates
-        zoom_scale: scale factor for PIL images (e.g. 0.5)
+        bbox: (xmin, ymin, xmax, ymax) in WSI level-0 pixel coordinates
         output_size: target output tile size in pixels
         fmt: 'pil' or 'openslide'
+        max_intermediate_size: max size of crop before resize (default 2048, cap memory)
 
     Returns:
         PIL Image resized to (output_size, output_size) or None on error
@@ -117,6 +181,7 @@ def extract_crop_from_tiff(
         height = int(ymax - ymin)
 
         if width <= 0 or height <= 0:
+            logger.debug(f"Invalid bbox dimensions: {width}x{height}")
             return None
 
         if fmt == 'openslide':
@@ -124,26 +189,52 @@ def extract_crop_from_tiff(
                 region = slide.read_region(
                     (int(xmin), int(ymin)),
                     0,  # level 0 (native)
-                    (width, height)
+                    (int(width), int(height))
                 )
                 crop = region.convert('RGB')
-        else:  # PIL
-            with Image.open(image_path) as img:
-                # Crop is in level-0 coords, so for PIL with zoom_scale, scale everything
-                x1_scaled = int(xmin * zoom_scale)
-                y1_scaled = int(ymin * zoom_scale)
-                x2_scaled = int(xmax * zoom_scale)
-                y2_scaled = int(ymax * zoom_scale)
+        else:  # PIL for TIFF/PNG/JPG
+            # For large TIFF files (>500MB), use OpenSlide to avoid memory issues
+            file_size = os.path.getsize(image_path)
+            is_large_tiff = (file_size > LARGE_FILE_THRESHOLD and
+                           os.path.splitext(image_path)[1].lower() in {'.tif', '.tiff'})
 
-                crop = img.crop((x1_scaled, y1_scaled, x2_scaled, y2_scaled))
+            if is_large_tiff and OPENSLIDE_AVAILABLE:
+                # Use OpenSlide for large TIFF files (more efficient)
+                with openslide.open_slide(image_path) as slide:
+                    region = slide.read_region(
+                        (int(xmin), int(ymin)),
+                        0,  # level 0 (native)
+                        (int(width), int(height))
+                    )
+                    crop = region.convert('RGB')
+            else:
+                # Use PIL for smaller files or when OpenSlide is not available
+                with Image.open(image_path) as img:
+                    crop = img.crop((int(xmin), int(ymin), int(xmax), int(ymax)))
 
-        # Resize to output_size
-        if crop.size[0] > 0 and crop.size[1] > 0:
-            crop = crop.resize((output_size, output_size), Image.Resampling.LANCZOS)
-            return crop
+        if crop.size[0] <= 0 or crop.size[1] <= 0:
+            logger.debug(f"Crop resulted in 0 size: {crop.size}")
+            return None
+
+        # Immediately resize if too large to avoid RAM explosion
+        if crop.size[0] > max_intermediate_size or crop.size[1] > max_intermediate_size:
+            logger.debug(f"Reducing large crop {crop.size} to intermediate size")
+            # Maintain aspect ratio
+            aspect = crop.size[0] / crop.size[1]
+            if aspect > 1:
+                new_w = max_intermediate_size
+                new_h = int(max_intermediate_size / aspect)
+            else:
+                new_h = max_intermediate_size
+                new_w = int(max_intermediate_size * aspect)
+            crop = crop.resize((new_w, new_h), Image.Resampling.LANCZOS)
+
+        # Final resize to output_size (square)
+        crop = crop.resize((output_size, output_size), Image.Resampling.LANCZOS)
+        return crop
 
     except Exception as e:
-        logger.warning(f"Failed to extract crop from {image_path} at {bbox}: {e}")
+        logger.error(f"Failed to extract crop from {image_path} at {bbox}: {e}")
 
     return None
 
@@ -172,7 +263,6 @@ def process_slide_annotations(args: Dict) -> Dict:
     image_path = args['image_path']
     geojson_path = args['geojson_path']
     output_dir = args['output_dir']
-    zoom_scale = args['zoom_scale']
     output_size = args['output_size']
     margin_ratio = args['margin_ratio']
 
@@ -184,12 +274,7 @@ def process_slide_annotations(args: Dict) -> Dict:
         logger.error(f"Unsupported format for {image_path}")
         return {'slide_name': slide_name, 'tiles_extracted': 0, 'error': 'Unsupported format'}
 
-    # Load metadata
-    metadata = load_image_metadata(image_path, fmt)
-    img_width = metadata['width']
-    img_height = metadata['height']
-
-    # Load GeoJSON and filter features
+    # Load GeoJSON first (avoid expensive image metadata load)
     try:
         geojson_obj = load_geojson(geojson_path)
     except Exception as e:
@@ -198,21 +283,22 @@ def process_slide_annotations(args: Dict) -> Dict:
 
     features = geojson_obj.get('features', [])
 
-    # Filter: exclude Tissue and exclude classifications
-    filtered_features = [
-        (idx, f) for idx, f in enumerate(features)
-        if f.get('properties', {}).get('classification') not in ('Tissue', 'exclude')
-    ]
+    # Process ALL features. Filter geometry type later.
+    # (Include all annotations regardless of classification or properties)
+    filtered_features = [(idx, f) for idx, f in enumerate(features)]
+
+    # Lazy-load metadata. For large files, assume very large dimensions.
+    img_width = 100000
+    img_height = 100000
 
     manifest = {
         'slide': slide_name,
         'image_format': fmt,
         'image_path': image_path,
-        'image_width': img_width,
-        'image_height': img_height,
+        'image_width': None,  # Will be filled lazily
+        'image_height': None,
         'output_size': output_size,
         'margin_ratio': margin_ratio,
-        'zoom_scale': zoom_scale,
         'features': {}
     }
 
@@ -242,7 +328,7 @@ def process_slide_annotations(args: Dict) -> Dict:
 
             # Extract and resize
             bbox_with_margin = (xmin_with_margin, ymin_with_margin, xmax_with_margin, ymax_with_margin)
-            crop = extract_crop_from_tiff(image_path, bbox_with_margin, zoom_scale, output_size, fmt)
+            crop = extract_crop_from_tiff(image_path, bbox_with_margin, output_size, fmt)
 
             if crop is None:
                 logger.warning(f"Failed to extract crop for feature {feat_idx} in {slide_name}")
@@ -329,10 +415,8 @@ def main():
                         help='Output tile size in pixels (square, default: 512)')
     parser.add_argument('--margin_ratio', type=float, default=0.2,
                         help='Margin as fraction of max bbox dimension (default: 0.2 = 20%%)')
-    parser.add_argument('--zoom_scale', type=float, default=0.5,
-                        help='Zoom scale for PIL images (default: 0.5)')
     parser.add_argument('--workers', type=int, default=None,
-                        help='Number of parallel workers (default: auto)')
+                        help='Number of parallel workers (default: auto-calculate based on RAM, max 4)')
 
     args = parser.parse_args()
 
@@ -355,14 +439,19 @@ def main():
             'image_path': pair['image_path'],
             'geojson_path': pair['geojson_path'],
             'output_dir': args.output,
-            'zoom_scale': args.zoom_scale,
             'output_size': args.output_size,
             'margin_ratio': args.margin_ratio
         })
 
     # Determine worker count
-    num_workers = args.workers or max(1, min(4, cpu_count() - 1))
-    logger.info(f"Using {num_workers} workers")
+    if args.workers is not None:
+        num_workers = args.workers
+        logger.info(f"Using {num_workers} worker(s) (user specified)")
+    else:
+        # Calculate based on RAM (90% of available)
+        tiff_paths = [p['image_path'] for p in pairs]
+        num_workers = calculate_safe_workers(tiff_paths, target_ram_percent=0.5)
+        logger.info(f"Auto-calculated: {num_workers} worker(s)")
 
     # Process in parallel
     with Pool(processes=num_workers) as pool:
