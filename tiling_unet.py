@@ -1,19 +1,9 @@
-"""
-tiling_unet.py — Tiling with annotations for UNet training
-
-Generates (image, mask) pairs from WSI .tiff + annotations .geojson pairs.
-- Sliding window grid at 1024×1024, zoom_scale=0.5, stride=512 (50% overlap)
-- Per glomerulus: guarantees ≥80% coverage in at least one tile (grid or centered fallback)
-- Rasterizes polygons to class masks (uint8 PNG, 0=background, 1+=class_id)
-- Stores metadata with coverage tracking for primary/secondary tiles
-- Dynamic worker scheduling based on available RAM
-"""
+"""Generate tiled training data for UNet from WSI TIFF + GeoJSON annotations."""
 
 import os
 import json
 import logging
 import argparse
-import re
 import numpy as np
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
@@ -119,9 +109,24 @@ def generate_otsu_mask(img_or_slide, downsample_factor=20):
     if hasattr(img_or_slide, 'get_thumbnail'):  # OpenSlide
         w, h = img_or_slide.level_dimensions[0]
         thumb = img_or_slide.get_thumbnail((w // downsample_factor, h // downsample_factor))
-    else:  # PIL Image
+    else:  # PIL Image — use draft mode + progressive resize for memory efficiency
         w, h = img_or_slide.size
-        thumb = img_or_slide.resize((w // downsample_factor, h // downsample_factor), Image.Resampling.LANCZOS)
+        target_w = w // downsample_factor
+        target_h = h // downsample_factor
+
+        try:
+            if hasattr(img_or_slide, 'draft'):
+                img_or_slide.draft('RGB', (target_w, target_h))
+            if w > 10000 or h > 10000:
+                scale = max(1, downsample_factor // 4)
+                intermediate = img_or_slide.resize((w // scale, h // scale), Image.Resampling.BILINEAR)
+                thumb = intermediate.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            else:
+                thumb = img_or_slide.resize((target_w, target_h), Image.Resampling.LANCZOS)
+        except MemoryError:
+            logger.warning(f"MemoryError during Otsu resize, using coarse downsampling")
+            scale = max(1, downsample_factor // 2)
+            thumb = img_or_slide.resize((w // scale, h // scale), Image.Resampling.NEAREST)
 
     thumb_cv = cv2.cvtColor(np.array(thumb.convert('RGB')), cv2.COLOR_RGB2HSV)
     saturation = cv2.medianBlur(thumb_cv[:, :, 1], 7)
@@ -129,11 +134,7 @@ def generate_otsu_mask(img_or_slide, downsample_factor=20):
     return mask, downsample_factor
 
 def has_tissue_in_mask(mask, x, y, tile_size, downsample_factor, min_ratio=0.01):
-    """Fast pre-check: does tile region contain tissue via Otsu mask?
-
-    Args:
-        min_ratio: Minimum tissue ratio to keep tile (default 0.01 = 1%).
-    """
+    """Fast pre-check if tile region contains tissue via Otsu mask."""
     if mask is None:
         return True
 
@@ -183,19 +184,33 @@ def get_available_ram_gb() -> float:
 def detect_format(file_path: str) -> Optional[str]:
     """Detect image format: 'openslide', 'pil', or None."""
     ext = Path(file_path).suffix.lower()
+    size = os.path.getsize(file_path)
+
+    # For TIFF files, strongly prefer OpenSlide if available (WSI-efficient)
+    if ext in {'.tif', '.tiff'}:
+        if openslide and size > LARGE_FILE_THRESHOLD:
+            return 'openslide'
+        # PIL for smaller TIFFs only
+        if size < LARGE_FILE_THRESHOLD:
+            return 'pil'
+        # Large TIFF without OpenSlide: warn and try PIL anyway (will be slow)
+        if not openslide and size > LARGE_FILE_THRESHOLD:
+            logger.warning(f"Large TIFF file ({size / 1e9:.1f} GB) without OpenSlide. Install 'openslide' for efficiency: pip install openslide-python")
+            return 'pil'
+        return 'pil'
+
+    # SVS, NDPI, VMS: OpenSlide only
     if openslide and ext in {'.svs', '.ndpi', '.vms'}:
         return 'openslide'
-    if ext in {'.tif', '.tiff', '.png', '.jpg', '.jpeg'}:
-        size = os.path.getsize(file_path)
-        if size > LARGE_FILE_THRESHOLD and openslide:
-            return 'openslide'
+
+    # Regular images
+    if ext in {'.png', '.jpg', '.jpeg'}:
         return 'pil'
+
     return None
 
 def load_slide(tiff_path: str) -> Tuple[object, int, int, str]:
-    """
-    Load slide and return (slide_handle, width, height, format_type).
-    """
+    """Load slide and return (slide_handle, width, height, format_type)."""
     fmt = detect_format(tiff_path)
     if fmt == 'openslide':
         try:
@@ -240,10 +255,7 @@ def load_geojson(geojson_path: str) -> Dict:
         return json.load(f)
 
 def find_tiff_geojson_pairs(input_dir: str) -> List[Dict]:
-    """
-    Find matched pairs of .tiff and .geojson files by stem.
-    Returns list of dicts with keys: 'image_path', 'geojson_path', 'stem'
-    """
+    """Find matched pairs of .tiff and .geojson files by stem."""
     input_path = Path(input_dir)
     tiffs = {f.stem: f for f in input_path.glob('*.tiff')} | \
             {f.stem: f for f in input_path.glob('*.tif')}
@@ -276,10 +288,7 @@ def generate_grid_tiles(
     tile_size: int = TILE_SIZE,
     stride: int = STRIDE
 ) -> List[Tuple[int, int, int, int]]:
-    """
-    Generate grid tile bounding boxes (native coordinates).
-    Returns list of (x, y, x_end, y_end).
-    """
+    """Generate grid tile bounding boxes (native coordinates)."""
     tiles = []
     for y in range(0, height - tile_size + 1, stride):
         for x in range(0, width - tile_size + 1, stride):
@@ -327,11 +336,7 @@ def rasterize_polygon(
     tile_box: Tuple[int, int, int, int],
     tile_size: int = TILE_SIZE
 ) -> np.ndarray:
-    """
-    Rasterize a polygon to a numpy array within a tile's bounding box.
-    tile_box = (x_native, y_native, x_native_end, y_native_end)
-    Returns: (tile_size, tile_size) uint8 array with pixel values = class_id
-    """
+    """Rasterize a polygon to a numpy array within a tile's bounding box."""
     mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
 
     try:
@@ -345,7 +350,6 @@ def rasterize_polygon(
         if intersection.is_empty or intersection.area == 0:
             return mask
 
-        # Rasterize the intersection onto the mask
         from shapely.geometry import GeometryCollection, MultiPolygon, LineString
         if isinstance(intersection, GeometryCollection):
             geoms = list(intersection.geoms)
@@ -359,7 +363,6 @@ def rasterize_polygon(
                 continue
             if hasattr(geom, 'exterior'):
                 coords = list(geom.exterior.coords)
-                # Convert native coordinates to tile-local coordinates
                 tile_coords = [
                     (c[0] - tile_box[0], c[1] - tile_box[1])
                     for c in coords
@@ -374,10 +377,7 @@ def rasterize_polygon(
     return mask
 
 def _bresenham_polygon(coords: List[Tuple[int, int]], size: int) -> Tuple[np.ndarray, np.ndarray]:
-    """
-    Rasterize polygon interior using scan-line fill algorithm.
-    Returns (row_indices, col_indices) for filled polygon.
-    """
+    """Rasterize polygon interior using scan-line fill algorithm."""
     if SKIMAGE_AVAILABLE:
         try:
             rr, cc = draw.polygon([c[1] for c in coords], [c[0] for c in coords], shape=(size, size))
@@ -386,16 +386,13 @@ def _bresenham_polygon(coords: List[Tuple[int, int]], size: int) -> Tuple[np.nda
             logger.debug(f"skimage.draw.polygon failed: {e}")
             pass
 
-    # Fallback: scan-line fill algorithm
     if len(coords) < 3:
         logger.debug(f"Polygon has {len(coords)} coords, need >= 3")
         return np.array([], dtype=int), np.array([], dtype=int)
 
-    # Convert to rows/cols format (y/x)
     rows = [int(round(c[1])) for c in coords]
     cols = [int(round(c[0])) for c in coords]
 
-    # Find bounding box
     min_row, max_row = min(rows), max(rows)
     min_col, max_col = min(cols), max(cols)
 
@@ -444,10 +441,7 @@ def compute_coverage(
     polygon_coords: List[List[float]],
     tile_box: Tuple[int, int, int, int]
 ) -> float:
-    """
-    Compute percentage of polygon area that overlaps with tile_box.
-    Returns: percentage (0-100) of polygon area covered by tile.
-    """
+    """Compute percentage of polygon area that overlaps with tile_box."""
     try:
         polygon = polygon_to_shapely(polygon_coords)
         if polygon.area == 0:
@@ -466,27 +460,11 @@ def combine_masks_with_priority(
     new_mask: np.ndarray,
     new_class_id: int
 ) -> np.ndarray:
-    """
-    Combine two class masks using explicit priority-based logic.
-
-    When pixels overlap (both masks have non-zero values), the class with
-    the HIGHEST priority wins, not the highest class_id.
-
-    Args:
-        current_mask: Current combined mask (uint8, 0=background, 1+=class_id)
-        new_mask: New glomerulus mask (uint8, contains 0 or class_id value)
-        new_class_id: The class ID being added (used for pixels where new_mask > 0)
-
-    Returns:
-        Combined mask with priority-based pixel selection
-    """
+    """Combine two class masks using explicit priority-based logic."""
     result = current_mask.copy()
 
     # Find pixels where new_mask has annotation (non-zero)
     new_pixels = new_mask > 0
-
-    # For each annotated pixel in new_mask, decide which class wins
-    current_class_ids = result[new_pixels]
     new_priority = CLASS_PRIORITY.get(new_class_id, 0)
 
     # Create mask of pixels where new class has higher priority
@@ -511,27 +489,7 @@ def compute_primary_secondary(
     grid_tiles: List[Tuple[int, int, int, int]],
     coverage_threshold: float = MIN_COVERAGE_PCT
 ) -> Dict[int, Dict]:
-    """
-    For each glomerulus, determine primary and secondary tiles.
-    Primary: tile with max coverage (if ≥threshold) or centered tile (if created)
-    Secondary: tile with next max coverage
-
-    IMPORTANT: For centered tiles, primary_coverage is PLACEHOLDER (will be
-    calculated after the centered tile is actually created). See
-    update_coverage_for_centered_tile() to compute real coverage.
-
-    Returns:
-    {
-        glom_id: {
-            'primary_tile_idx': int or None (None means centered tile needed),
-            'secondary_tile_idx': int or None,
-            'primary_coverage': float (real for grid, placeholder for centered),
-            'secondary_coverage': float,
-            'primary_is_centered': bool,
-            'needs_centered_tile': bool
-        }
-    }
-    """
+    """For each glomerulus, determine primary and secondary tiles."""
     assignment = {}
 
     for glom_id, glom_data in enumerate(glomeruli):
@@ -583,16 +541,7 @@ def update_coverage_for_centered_tile(
     tile_box: Tuple[int, int, int, int],
     assignment: Dict[int, Dict]
 ) -> None:
-    """
-    Update primary_coverage for a glomerulus that needed a centered tile.
-    Call this AFTER the centered tile box is finalized.
-
-    Args:
-        glom_id: The glomerulus ID
-        glom_coords: The glomerulus polygon coordinates
-        tile_box: The centered tile's bounding box (x, y, x_end, y_end)
-        assignment: The assignments dict to update in-place
-    """
+    """Update primary_coverage for a glomerulus that needed a centered tile."""
     if glom_id in assignment and assignment[glom_id]['primary_is_centered']:
         real_coverage = compute_coverage(glom_coords, tile_box)
         assignment[glom_id]['primary_coverage'] = real_coverage
@@ -626,17 +575,7 @@ def process_slide_pair(
     zoom_scale: float = ZOOM_SCALE,
     stride: int = STRIDE
 ) -> Dict:
-    """
-    Process a single TIFF+GeoJSON pair and generate tiles, masks, and metadata.
-
-    Args:
-        pair: {'stem': str, 'image_path': str, 'geojson_path': str}
-        output_dir: base output directory (will create {output_dir}/{stem}/)
-        class_map: canonical {'class_name': class_id, ...}
-
-    Returns:
-        {'status': 'success' or 'error', 'slide_name': str, 'message': str}
-    """
+    """Process a single TIFF+GeoJSON pair and generate tiles, masks, and metadata."""
     stem = pair['stem']
     image_path = pair['image_path']
     geojson_path = pair['geojson_path']
@@ -919,19 +858,7 @@ def dynamic_schedule(
     tile_size: int = TILE_SIZE,
     max_workers: int = None
 ) -> List[Dict]:
-    """
-    Process pairs with dynamic worker admission based on available RAM.
-
-    Args:
-        pairs: list of {'stem', 'image_path', 'geojson_path'}
-        output_dir: where to save outputs
-        class_map: class name → id mapping
-        ram_fraction: fraction of available RAM to use (0-1)
-        tile_size: tile size for worker calculation
-
-    Returns:
-        list of result dicts
-    """
+    """Process pairs with dynamic worker admission based on available RAM."""
     queue = deque(sorted(pairs, key=lambda p: os.path.getsize(p['image_path']), reverse=False))
     active = {}  # future → (pair, mem_estimate)
     results = []
@@ -997,6 +924,12 @@ def dynamic_schedule(
 # CLI
 # ============================================================================
 
+def slide_already_processed(stem: str, output_dir: str) -> bool:
+    """Check if a slide's output directory exists with tiles."""
+    slide_dir = Path(output_dir) / stem
+    images_dir = slide_dir / 'images'
+    return images_dir.exists() and list(images_dir.glob('*.png'))
+
 def main():
     parser = argparse.ArgumentParser(
         description='Generate tiled training data for UNet from WSI + GeoJSON annotations'
@@ -1042,6 +975,11 @@ def main():
         help='Limit number of slides to process (for testing)'
     )
     parser.add_argument(
+        '--resume',
+        action='store_true',
+        help='Skip slides already processed (have tiles in output dir)'
+    )
+    parser.add_argument(
         '--workers',
         type=int,
         default=None,
@@ -1055,6 +993,17 @@ def main():
     if not pairs:
         logger.error(f"No TIFF+GeoJSON pairs found in {args.input}")
         return
+
+    # Filter already-processed slides if --resume
+    if args.resume:
+        os.makedirs(args.output, exist_ok=True)
+        already_done = [p for p in pairs if slide_already_processed(p['stem'], args.output)]
+        pairs = [p for p in pairs if not slide_already_processed(p['stem'], args.output)]
+        if already_done:
+            logger.info(f"--resume: Skipping {len(already_done)} already-processed slides")
+            for p in already_done:
+                logger.info(f"  ✓ {p['stem']}")
+        logger.info(f"Will process {len(pairs)} remaining slides")
 
     if args.max_slides:
         pairs = pairs[:args.max_slides]
