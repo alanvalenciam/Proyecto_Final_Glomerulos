@@ -540,7 +540,7 @@ if __name__ == "__main__":
     import argparse
 
     # Defaults
-    base_dir = Path("Salidas/dataset_aug")
+    base_dir = Path("Salidas/Tiles_UNet")
     default_input = str(base_dir)
     default_output = str(Path("Salidas/Normalizados"))
 

@@ -75,19 +75,12 @@ Proyecto_Final_Glomerulos/
 │   │   │   └── annotations.json       # Metadata + tile registry
 │   │   └── biopsia_002/
 │   │
-│   ├── dataset_aug/                   # Step 2: Augmented tiles
-│   │   ├── biopsia_001/
-│   │   │   ├── images/                # Original + 6 deterministic + 0-3 synthetic
-│   │   │   ├── masks/
-│   │   │   └── annotations.json
-│   │   └── biopsia_002/
-│   │
-│   ├── Normalizados/                  # Step 3: Color-normalized tiles
+│   ├── Normalizados/                  # Step 2: Color-normalized tiles
 │   │   ├── biopsia_001/
 │   │   │   └── images/                # Reinhard color-normalized PNGs
 │   │   └── biopsia_002/
 │   │
-│   ├── Estandarizados/                # Step 4: Z-score standardized tiles
+│   ├── Estandarizados/                # Step 3: Z-score standardized tiles
 │   │   ├── biopsia_001/
 │   │   │   └── images/                # Z-score as uint8 (reversible encoding)
 │   │   └── biopsia_002/
@@ -100,11 +93,10 @@ Proyecto_Final_Glomerulos/
 │           └── runs/                  # TensorBoard logs
 │
 ├── tiling_unet.py                     # Step 1: WSI → tiles
-├── augmentation.py                    # Step 2: Data augmentation
-├── normalizacion.py                   # Step 3: Color normalization
-├── estandarizacion.py                 # Step 4: Z-score standardization
+├── normalizacion.py                   # Step 2: Color normalization
+├── estandarizacion.py                 # Step 3: Z-score standardization
 │
-├── U-Net_Training.ipynb               # Step 5: Complete training notebook
+├── U-Net_Training.ipynb               # Step 4: Complete training notebook
 │                                         (includes dataset, losses, U-Net model, training loop)
 │
 └── WORKFLOW.md                        # This file
@@ -146,27 +138,10 @@ python tiling_unet.py --input Entradas/ --output Salidas/Tiles_UNet/
 
 ---
 
-### Step 2: Data Augmentation
+### Step 2: Color Normalization (Reinhard)
 
 ```bash
-python augmentation.py --tiles-dir Salidas/Tiles_UNet --output-dir Salidas/dataset_aug
-```
-
-**What it does:**
-- **Component A:** Applies 6 deterministic geometric transforms (flip, rotate) to ALL tiles
-- **Analysis:** Counts class distribution; if underrepresented classes (Esclerosado, Excluido) < 20% / 15%, triggers Component B
-- **Component B:** Generates 0–3 synthetic augmentations per original tile using albumentations (stochastic), with pHash deduplication
-
-**Parallelism:** Component A is parallelized (ProcessPoolExecutor + RAM backpressure). Component B remains single-threaded (pHash deduplication).
-
-**Time:** ~10–30 minutes (depends on dataset size and synthetic augmentation count)
-
----
-
-### Step 3: Color Normalization (Reinhard)
-
-```bash
-python normalizacion.py --input Salidas/dataset_aug --output Salidas/Normalizados
+python normalizacion.py --input Salidas/Tiles_UNet --output Salidas/Normalizados
 ```
 
 **What it does:**
@@ -178,11 +153,11 @@ python normalizacion.py --input Salidas/dataset_aug --output Salidas/Normalizado
 
 **Time:** ~10–15 minutes
 
-**Note:** Masks are NOT processed here (binary labels don't need color normalization). They stay in `Salidas/dataset_aug/` and are loaded directly during training.
+**Note:** Masks are NOT processed here (binary labels don't need color normalization). They stay in `Salidas/Tiles_UNet/` and are loaded directly during training.
 
 ---
 
-### Step 4: Z-Score Standardization
+### Step 3: Z-Score Standardization
 
 ```bash
 python estandarizacion.py --input Salidas/Normalizados --output Salidas/Estandarizados
@@ -199,7 +174,7 @@ python estandarizacion.py --input Salidas/Normalizados --output Salidas/Estandar
 
 ---
 
-### Step 5: Training (U-Net)
+### Step 4: Training (U-Net)
 
 ```bash
 jupyter notebook U-Net_Training.ipynb
@@ -207,11 +182,12 @@ jupyter notebook U-Net_Training.ipynb
 
 **What it does (in the notebook):**
 - Loads standardized images + masks, split 70% train / 15% val / 15% test (stratified by biopsia)
-- Defines U-Net architecture (4 encoder + 4 decoder levels, 5 output classes)
+- Applies online augmentation (flips, rotations, noise) to train split only — never to val or test
+- Defines U-Net architecture (4 encoder + 4 decoder levels, 2 output classes)
 - Implements combined BCE + Dice loss function with per-class weights for imbalance
 - Trains with AdamW + cosine annealing LR schedule + 5-epoch linear warmup
-- Evaluates with MeanIoU metric (intersection over union, per-class)
-- Checkpoints best model (by val MeanIoU) + last model
+- Evaluates with Binary Segmentation Metrics (Accuracy, Precision, Recall, F1, ROC-AUC)
+- Checkpoints best model (by val F1) + last model
 
 **To run training:**
 1. Open the notebook with `jupyter notebook U-Net_Training.ipynb`
@@ -259,28 +235,13 @@ Options:
 
 ---
 
-#### `augmentation.py`
-
-```bash
-python augmentation.py [OPTIONS]
-
-Options:
-  --tiles-dir PATH            Path to Tiles_UNet output
-  --output-dir PATH           Path to dataset_aug output
-  --target-esclerosado FLOAT  Target % for Esclerosado class (0.20 default)
-  --target-excluido FLOAT     Target % for Excluido class (0.15 default)
-  --help                      Show this help
-```
-
----
-
 #### `normalizacion.py`
 
 ```bash
 python normalizacion.py [OPTIONS]
 
 Options:
-  --input PATH                Path to input tiles (default: Salidas/dataset_aug)
+  --input PATH                Path to input tiles (default: Salidas/Tiles_UNet)
   --output PATH               Path to output (default: Salidas/Normalizados)
   --template PATH             Single template image (optional)
   --workers INT               Parallel workers (auto-calculated)
@@ -308,11 +269,12 @@ Options:
 #### `U-Net_Training.ipynb`
 
 Complete Jupyter notebook containing:
-- **Dataset loading**: PyTorch Dataset loader for images and masks
+- **Dataset loading**: PyTorch Dataset loader with stratified train/val/test split by biopsia
+- **Online augmentation**: Applied to train split only (HorizontalFlip, VerticalFlip, RandomRotate90, Transpose, Rotate, GaussNoise, GaussianBlur)
 - **Loss functions**: Combined BCE + Dice loss with per-class weighting
 - **U-Net architecture**: 4-level encoder-decoder with skip connections
 - **Training loop**: AdamW optimizer, cosine annealing LR schedule, 5-epoch warmup
-- **Evaluation**: MeanIoU metric computation and per-class IoU tracking
+- **Evaluation**: Binary Segmentation Metrics (Accuracy, Precision, Recall, F1, ROC-AUC)
 - **Checkpointing**: Saves best and last models + metrics report
 
 **To run:**
@@ -327,12 +289,12 @@ jupyter notebook U-Net_Training.ipynb
 - `BATCH_SIZE`: Batch size (default: 4)
 - `LEARNING_RATE`: Initial learning rate (default: 1e-3)
 - `IMAGES_DIR`: Path to standardized images (default: Salidas/Estandarizados)
-- `MASKS_DIR`: Path to masks (default: Salidas/dataset_aug)
+- `MASKS_DIR`: Path to masks (default: Salidas/Tiles_UNet)
 - `OUTPUT_DIR`: Checkpoint output directory (default: checkpoints)
 
 **Output:**
 - `checkpoints/unet_YYYYMMDD_HHMMSS_best.pth` — best validation model
-- `checkpoints/unet_YYYYMMDD_HHMMSS_report.json` — final metrics (loss, MeanIoU, per-class IoU)
+- `checkpoints/unet_YYYYMMDD_HHMMSS_report.json` — final metrics (loss, per-class metrics)
 - TensorBoard logs in `runs/` subdirectory for visualization
 
 ---
@@ -437,7 +399,7 @@ wmic process where processid=$($p.Id) call setpriority 1  # BELOW_NORMAL
 **Cause:** Path mismatch or missing intermediate output.
 
 **Fix:**
-1. Verify directory structure: `dir Salidas\dataset_aug\biopsia_001\images\`
+1. Verify directory structure: `dir Salidas\Tiles_UNet\biopsia_001\images\`
 2. Check that previous step completed successfully (look for `*.json` metadata files)
 3. Verify relative paths: scripts should run from project root
 
@@ -486,25 +448,22 @@ python -c "import torch; print(f'PyTorch OK, CUDA: {torch.cuda.is_available()}')
 # 2. Tiling (5–20 min)
 python tiling_unet.py
 
-# 3. Augmentation (10–30 min)
-python augmentation.py
-
-# 4. Normalization (10–15 min)
+# 3. Normalization (10–15 min)
 python normalizacion.py
 
-# 5. Standardization (10–15 min)
+# 4. Standardization (10–15 min)
 python estandarizacion.py
 
-# 6. Training (2–8 hours, depending on epochs)
+# 5. Training (2–8 hours, depending on epochs)
 jupyter notebook U-Net_Training.ipynb
 # Open the notebook, modify parameters if needed, and run all cells
 
-# 7. Monitor in TensorBoard (in another terminal)
+# 6. Monitor in TensorBoard (in another terminal)
 tensorboard --logdir checkpoints
 # Open http://localhost:6006
 ```
 
-Total end-to-end time: **~2–3 days** for a full dataset (tiling + augmentation + preprocessing + 50 epochs training).
+Total end-to-end time: **~2–3 days** for a full dataset (tiling + preprocessing + 50 epochs training).
 
 ---
 
