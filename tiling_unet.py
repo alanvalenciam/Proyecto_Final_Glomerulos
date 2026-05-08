@@ -47,7 +47,6 @@ Image.MAX_IMAGE_PIXELS = None
 TILE_SIZE = 1024
 ZOOM_SCALE = 0.5
 STRIDE = 512
-OVERLAP = TILE_SIZE - STRIDE
 MIN_COVERAGE_PCT = 60.0
 OUTPUT_FORMAT = 'png'
 COMPRESSION = 0
@@ -100,16 +99,16 @@ DOWNSAMPLE_FACTOR = 20    # for Otsu mask generation
 # Tissue filtering functions (from tiles.py)
 # ============================================================================
 
-def generate_otsu_mask(img_or_slide, downsample_factor=20):
+def generate_otsu_mask(img_or_slide: object, downsample_factor: int = 20) -> Tuple[Optional[np.ndarray], Optional[int]]:
     """Generate binary tissue mask via Otsu thresholding on HSV saturation."""
     if not OPENCV_AVAILABLE:
         logger.warning("OpenCV not available, skipping Otsu mask")
         return None, None
 
-    if hasattr(img_or_slide, 'get_thumbnail'):  # OpenSlide
+    if hasattr(img_or_slide, 'get_thumbnail'):  # OpenSlide — memory-efficient
         w, h = img_or_slide.level_dimensions[0]
         thumb = img_or_slide.get_thumbnail((w // downsample_factor, h // downsample_factor))
-    else:  # PIL Image — use draft mode + progressive resize for memory efficiency
+    else:  # PIL Image — three-stage aggressive downsampling to avoid full load
         w, h = img_or_slide.size
         target_w = w // downsample_factor
         target_h = h // downsample_factor
@@ -117,23 +116,29 @@ def generate_otsu_mask(img_or_slide, downsample_factor=20):
         try:
             if hasattr(img_or_slide, 'draft'):
                 img_or_slide.draft('RGB', (target_w, target_h))
-            if w > 10000 or h > 10000:
-                scale = max(1, downsample_factor // 4)
-                intermediate = img_or_slide.resize((w // scale, h // scale), Image.Resampling.BILINEAR)
+            if w > 20000 or h > 20000:
+                stage1 = w // 50
+                stage2 = w // 5
+                intermediate1 = img_or_slide.resize((stage1, h // 50), Image.Resampling.NEAREST)
+                intermediate2 = intermediate1.resize((stage2, h // 5), Image.Resampling.BILINEAR)
+                thumb = intermediate2.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            elif w > 10000 or h > 10000:
+                scale = max(1, downsample_factor // 2)
+                intermediate = img_or_slide.resize((w // scale, h // scale), Image.Resampling.NEAREST)
                 thumb = intermediate.resize((target_w, target_h), Image.Resampling.LANCZOS)
             else:
                 thumb = img_or_slide.resize((target_w, target_h), Image.Resampling.LANCZOS)
         except MemoryError:
-            logger.warning(f"MemoryError during Otsu resize, using coarse downsampling")
-            scale = max(1, downsample_factor // 2)
-            thumb = img_or_slide.resize((w // scale, h // scale), Image.Resampling.NEAREST)
+            logger.warning(f"MemoryError during Otsu resize, using extreme downsampling")
+            extreme_scale = max(1, downsample_factor * 5)
+            thumb = img_or_slide.resize((w // extreme_scale, h // extreme_scale), Image.Resampling.NEAREST)
 
     thumb_cv = cv2.cvtColor(np.array(thumb.convert('RGB')), cv2.COLOR_RGB2HSV)
     saturation = cv2.medianBlur(thumb_cv[:, :, 1], 7)
     _, mask = cv2.threshold(saturation, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return mask, downsample_factor
 
-def has_tissue_in_mask(mask, x, y, tile_size, downsample_factor, min_ratio=0.01):
+def has_tissue_in_mask(mask: Optional[np.ndarray], x: int, y: int, tile_size: int, downsample_factor: int, min_ratio: float = 0.01) -> bool:
     """Fast pre-check if tile region contains tissue via Otsu mask."""
     if mask is None:
         return True
@@ -150,7 +155,7 @@ def has_tissue_in_mask(mask, x, y, tile_size, downsample_factor, min_ratio=0.01)
     tissue_ratio = tissue_pixels / patch.size
     return tissue_ratio >= min_ratio
 
-def is_mostly_background(tile, min_std=15.0):
+def is_mostly_background(tile: Image.Image, min_std: float = 15.0) -> bool:
     """Return True if tile lacks tissue (should be skipped)."""
     gray = np.array(tile.convert('L'))
     return float(np.std(gray)) < min_std
@@ -235,7 +240,6 @@ def extract_tile_pil(slide: Image.Image, x: int, y: int, size: int) -> Image.Ima
     y_end = min(y + size, slide.height)
     tile = slide.crop((x, y, x_end, y_end))
 
-    # Pad if at edge
     if tile.size != (size, size):
         padded = Image.new('RGB', (size, size), (255, 255, 255))
         padded.paste(tile, (0, 0))
@@ -243,7 +247,7 @@ def extract_tile_pil(slide: Image.Image, x: int, y: int, size: int) -> Image.Ima
 
     return tile
 
-def extract_tile_openslide(slide, x: int, y: int, size: int, level: int = 0) -> Image.Image:
+def extract_tile_openslide(slide: object, x: int, y: int, size: int, level: int = 0) -> Image.Image:
     """Extract a tile from an OpenSlide slide."""
     tile = slide.read_region((x, y), level, (size, size))
     tile = tile.convert('RGB')
@@ -314,12 +318,6 @@ def generate_grid_tiles(
             tiles.append((x, y, x + tile_size, y + tile_size))
 
     return tiles
-
-def polygon_to_bbox(polygon_coords: List[List[float]]) -> Tuple[float, float, float, float]:
-    """Extract bounding box from polygon coordinates. Returns (xmin, ymin, xmax, ymax)."""
-    xs = [p[0] for p in polygon_coords]
-    ys = [p[1] for p in polygon_coords]
-    return min(xs), min(ys), max(xs), max(ys)
 
 def polygon_to_shapely(polygon_coords: List[List[float]]) -> Polygon:
     """Convert polygon coordinate list to Shapely Polygon."""
@@ -403,9 +401,7 @@ def _bresenham_polygon(coords: List[Tuple[int, int]], size: int) -> Tuple[np.nda
 
     filled_rr, filled_cc = [], []
 
-    # Scan-line fill from top to bottom
     for row in range(min_row, max_row + 1):
-        # Find intersections with this scan line
         intersections = []
         for i in range(len(coords)):
             y1 = rows[i]
@@ -413,18 +409,14 @@ def _bresenham_polygon(coords: List[Tuple[int, int]], size: int) -> Tuple[np.nda
             x1 = cols[i]
             x2 = cols[(i + 1) % len(coords)]
 
-            # Check if this edge intersects the scan line
             if (y1 <= row <= y2) or (y2 <= row <= y1):
                 if y1 != y2:
-                    # Interpolate x coordinate
                     x_intersect = x1 + (row - y1) * (x2 - x1) / (y2 - y1)
                     intersections.append(x_intersect)
                 elif y1 == row:
-                    # Horizontal edge, use both endpoints
                     intersections.append(x1)
                     intersections.append(x2)
 
-        # Sort intersections and fill between them
         if len(intersections) >= 2:
             intersections.sort()
             for j in range(0, len(intersections), 2):
@@ -467,8 +459,6 @@ def combine_masks_with_priority(
     new_pixels = new_mask > 0
     new_priority = CLASS_PRIORITY.get(new_class_id, 0)
 
-    # Create mask of pixels where new class has higher priority
-    # For background (0), treat priority as 0
     for idx_flat in np.where(new_pixels.ravel())[0]:
         row, col = np.unravel_index(idx_flat, new_pixels.shape)
         current_class_id = result[row, col]
@@ -663,7 +653,6 @@ def process_slide_pair(
             else:
                 tile_img = extract_tile_pil(slide, x, y, tile_size)
 
-            # Build mask from all glomeruli in this tile
             mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
             tile_glomeruli = []
 
@@ -744,7 +733,6 @@ def process_slide_pair(
             else:
                 tile_img = extract_tile_pil(slide, x, y, tile_size)
 
-            # Build mask
             mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
             tile_glomeruli = []
 
