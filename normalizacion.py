@@ -2,12 +2,15 @@ import os
 import cv2
 import numpy as np
 from pathlib import Path
-from multiprocessing import Pool, cpu_count
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from multiprocessing import cpu_count
+from collections import deque
 import logging
 import time
 import random
 import json
-from typing import Optional, Tuple
+import shutil
+from typing import Optional, Tuple, Dict
 
 logging.basicConfig(
     level=logging.INFO,
@@ -342,10 +345,19 @@ def _normalize_single_tile(args: tuple) -> Optional[str]:
         return None
 
 
+def _estimate_tile_memory_gb(tile_path: Path) -> float:
+    """Estimate RAM needed for a tile: file_size × 8 (for uint8→float32 conversion + processing)."""
+    if tile_path.exists():
+        size_mb = tile_path.stat().st_size / (1024 ** 2)
+        return (size_mb * 8) / 1024.0
+    return 0.05  # Conservative default: 50 MB
+
+
 def process_folder(input_dir: str, output_dir: str, template_path: Optional[str] = None, template_tiles: Optional[list[str]] = None, num_workers: Optional[int] = None, tile_size: int = 1024,
-                   min_tissue_ratio: float = 0.05, bg_l_threshold: int = 230, min_saturation: int = 10, rebuild_template: bool = False) -> None:
+                   min_tissue_ratio: float = 0.05, bg_l_threshold: int = 230, min_saturation: int = 10, rebuild_template: bool = False,
+                   ram_fraction: float = 0.75, min_free_gb: float = 1.0) -> None:
     """
-    Recursively normalize tiles using Reinhard stain normalization with parallel processing.
+    Recursively normalize tiles using dynamic parallelism (memory-aware admission control).
 
     Args:
         input_dir: Root directory (recursively searches for tiles)
@@ -358,13 +370,14 @@ def process_folder(input_dir: str, output_dir: str, template_path: Optional[str]
         bg_l_threshold: L channel threshold for background (default 230)
         min_saturation: Minimum HSV saturation for tissue (default 10)
         rebuild_template: If True, force rebuild template from tiles (ignore cache)
+        ram_fraction: Fraction of available RAM to use for processing (0.75 default)
+        min_free_gb: Minimum free RAM to always keep available (1.0 default)
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Loading reference template...")
     try:
         if template_path and Path(template_path).is_file():
-            # Single template image provided
             logger.info(f"Using single template image: {template_path}")
             template_img = leer_imagen(template_path)
             if template_img is None:
@@ -373,10 +386,8 @@ def process_folder(input_dir: str, output_dir: str, template_path: Optional[str]
             target_means, target_stds = get_lab_stats(template_img, mask=mask)
             logger.info(f"Template: L={target_means[0]:.1f}±{target_stds[0]:.1f}, a={target_means[1]:.1f}±{target_stds[1]:.1f}, b={target_means[2]:.1f}±{target_stds[2]:.1f}")
         elif template_tiles:
-            # Use specific representative tiles
             target_means, target_stds = compute_template_from_tiles(template_tiles, bg_l_threshold=bg_l_threshold, min_saturation=min_saturation)
         else:
-            # Auto-build from tiles (cached)
             target_means, target_stds = load_or_build_template(
                 input_dir,
                 template_stats_file=Path(input_dir).parent / ".normalizacion" / "template_stats.json",
@@ -391,59 +402,147 @@ def process_folder(input_dir: str, output_dir: str, template_path: Optional[str]
     valid_extensions = {'.png', '.jpg', '.jpeg'}
     input_path = Path(input_dir)
 
-    # Recursive search for tiles, preserving folder structure
-    tile_paths = [
-        p for p in input_path.rglob('*')
-        if p.suffix.lower() in valid_extensions
-    ]
+    tile_paths = [p for p in input_path.rglob('*') if p.suffix.lower() in valid_extensions]
+    logger.info(f"Total de archivos encontrados: {len(tile_paths)}")
 
-    if not tile_paths:
-        logger.warning(f"No tiles (.png/.jpg/.jpeg) found in: {input_dir}")
+    # Separar imágenes de máscaras por convención de nombre
+    image_paths = [p for p in tile_paths if not p.name.endswith('_mask.png')]
+    mask_paths = [p for p in tile_paths if p.name.endswith('_mask.png')]
+    logger.info(f"Imágenes a normalizar: {len(image_paths)}, Máscaras a copiar: {len(mask_paths)}")
+
+    if len(image_paths) == 0:
+        logger.warning("No se encontraron tiles PNG (excluidas máscaras). Nada que hacer.")
         return
 
-    logger.info(f"Found {len(tile_paths)} tile(s) to process recursively\n")
+    target_means, target_stds = load_or_build_template(
+        input_dir,
+        template_stats_file=Path(input_dir).parent / ".normalizacion" / "template_stats.json",
+        rebuild=rebuild_template,
+        bg_l_threshold=bg_l_threshold,
+        min_saturation=min_saturation
+    )
 
     # Sort by file size (descending) for load balancing
-    tile_paths.sort(key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
+    image_paths.sort(key=lambda p: p.stat().st_size if p.exists() else 0, reverse=True)
 
-    # Calculate num_workers if not provided
     if num_workers is None:
         num_workers = _safe_worker_count(tile_size_hint=tile_size)
 
-    # Build task list: preserve folder structure in output
-    tasks = []
-    for tile_path in tile_paths:
+    # Build task list with output paths
+    tasks = deque()
+    task_memory_estimates: Dict = {}
+
+    for tile_path in image_paths:
         rel_path = tile_path.relative_to(input_path)
         output_path = Path(output_dir) / rel_path
-        tasks.append((str(tile_path), str(output_path), target_means, target_stds, min_tissue_ratio, bg_l_threshold, min_saturation))
+        task_tuple = (str(tile_path), str(output_path), target_means, target_stds, min_tissue_ratio, bg_l_threshold, min_saturation)
+        mem_est = _estimate_tile_memory_gb(tile_path)
+        tasks.append(task_tuple)
+        task_memory_estimates[str(tile_path)] = mem_est
 
-    logger.info(f"Starting parallel normalization with {num_workers} workers...\n")
+    # RAM budget (one-time calculation at startup)
+    try:
+        import psutil
+        available_gb = psutil.virtual_memory().available / (1024 ** 3)
+    except ImportError:
+        available_gb = 8.0
+
+    ram_budget_gb = available_gb * ram_fraction
+    logger.info(f"RAM budget: {available_gb:.2f}GB available, using {ram_budget_gb:.2f}GB ({ram_fraction*100:.0f}%) with {min_free_gb}GB safety margin")
+    logger.info(f"Starting dynamic parallel normalization with {num_workers} workers, {len(image_paths)} tiles\n")
+
     start_time = time.time()
-
     success_count = 0
     skip_count = 0
+    failed_count = 0
+    completed = 0
 
-    with Pool(processes=num_workers) as pool:
-        for i, result in enumerate(pool.imap_unordered(_normalize_single_tile, tasks, chunksize=10), 1):
-            if result == "success":
-                success_count += 1
-                if i % 100 == 0:
-                    logger.info(f"Tile {i}/{len(tasks)} completed ({success_count} success, {skip_count} skipped)")
-            elif result == "skipped":
-                skip_count += 1
+    # Dynamic admission loop with ProcessPoolExecutor
+    used_ram_gb = 0.0
+    active_futures: Dict = {}  # Maps Future → (tile_path_str, memory_estimate)
+
+    def try_submit() -> None:
+        """Try to submit next task from queue if RAM budget allows."""
+        nonlocal used_ram_gb
+        while tasks:
+            task = tasks[0]
+            tile_path_str = task[0]
+            mem_est = task_memory_estimates[tile_path_str]
+
+            # Dual RAM check: software counter AND live OS query
+            try:
+                import psutil
+                os_available = psutil.virtual_memory().available / (1024 ** 3)
+            except ImportError:
+                os_available = ram_budget_gb + min_free_gb
+
+            if used_ram_gb + mem_est <= ram_budget_gb and os_available > min_free_gb:
+                # Submit task
+                task = tasks.popleft()
+                future = executor.submit(_normalize_single_tile, task)
+                active_futures[future] = (task[0], mem_est)
+                used_ram_gb += mem_est
             else:
-                logger.warning(f"Tile {i}/{len(tasks)} failed")
+                # Wait for running tasks to finish
+                break
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        try_submit()
+
+        while active_futures:
+            done, _ = wait(active_futures, return_when=FIRST_COMPLETED)
+
+            for future in done:
+                tile_path_str, mem_est = active_futures.pop(future)
+                used_ram_gb -= mem_est
+
+                try:
+                    result = future.result()
+                    completed += 1
+                    if result == "success":
+                        success_count += 1
+                    elif result == "skipped":
+                        skip_count += 1
+                    else:
+                        failed_count += 1
+
+                    if completed % 50 == 0:
+                        logger.info(f"Tile {completed}/{len(tile_paths)} completed ({success_count} success, {skip_count} skipped, {failed_count} failed)")
+                except Exception as e:
+                    logger.error(f"Task failed: {e}")
+                    failed_count += 1
+
+                # Try to admit next task after one finishes
+                try_submit()
 
     elapsed = time.time() - start_time
-    logger.info(f"\nComplete! {success_count}/{len(tasks)} tiles normalized, {skip_count} skipped in {elapsed:.2f}s")
+    logger.info(f"\n✓ Procesamiento de imágenes completado: {completed}/{len(image_paths)} tiles ")
+
+    # Copiar máscaras sin transformar (son labels 0-4, no se normalizan)
+    logger.info(f"Copiando {len(mask_paths)} máscaras sin transformación...")
+    copied = 0
+    failed = 0
+    for mask_path in mask_paths:
+        try:
+            rel_path = mask_path.relative_to(input_dir)
+            output_path = Path(output_dir) / rel_path
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(mask_path, output_path)
+            copied += 1
+        except Exception as e:
+            logger.error(f"Error copiando {mask_path}: {e}")
+            failed += 1
+
+    logger.info(f"✓ Máscaras copiadas: {copied}/{len(mask_paths)} ({failed} fallos)")
+    logger.info(f"✓ Procesamiento completado: {completed + copied}/{len(image_paths) + len(mask_paths)} archivos totales")
 
 if __name__ == "__main__":
     import argparse
 
     # Defaults
-    base_dir = Path("/Users/olivera/Documents/Proyecto_Final_Glomerulos/Salidas/Imagen")
+    base_dir = Path("Salidas/dataset_aug")
     default_input = str(base_dir)
-    default_output = str(base_dir.parent / "Normalizados")
+    default_output = str(Path("Salidas/Normalizados"))
 
     # Default template references — reads all images from referencias/ folder
     referencias_dir = Path("referencias")
@@ -526,6 +625,18 @@ Uso personalizado:
         action="store_true",
         help="Recalcular template desde tiles (ignora cache)"
     )
+    parser.add_argument(
+        "--ram-fraction",
+        type=float,
+        default=0.75,
+        help="Fracción de RAM disponible para usar (0.0-1.0, default: 0.75)"
+    )
+    parser.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=1.0,
+        help="Mínimo GB de RAM libre a mantener (default: 1.0)"
+    )
 
     args = parser.parse_args()
     process_folder(
@@ -538,5 +649,7 @@ Uso personalizado:
         min_tissue_ratio=args.min_tissue_ratio,
         bg_l_threshold=args.bg_l_threshold,
         min_saturation=args.min_saturation,
-        rebuild_template=args.rebuild_template
+        rebuild_template=args.rebuild_template,
+        ram_fraction=args.ram_fraction,
+        min_free_gb=args.min_free_gb
     )

@@ -17,6 +17,9 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 import shutil
 import random
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from collections import deque
+import time
 
 import numpy as np
 import cv2
@@ -150,6 +153,72 @@ DETERMINISTIC_TRANSFORMS = {
 }
 
 
+def _estimate_tile_memory_gb(tile_path: Path) -> float:
+    """
+    Estimate RAM needed for a tile: file_size × 8
+    (original tile + 6 transforms + output buffer = ~7x amplification).
+    """
+    if tile_path.exists():
+        size_mb = tile_path.stat().st_size / (1024 ** 2)
+        return (size_mb * 8) / 1024.0
+    return 0.05  # Conservative default: 50 MB
+
+
+def _augment_tile_worker(tile_path: str, output_dir: str, deterministic_transforms: Dict) -> Tuple[str, bool]:
+    """
+    Worker function: apply 6 deterministic transforms to a single tile.
+    Runs in separate process.
+
+    Args:
+        tile_path: Path to input tile image
+        output_dir: Directory to save augmented tiles
+        deterministic_transforms: Dict of transform name → function
+
+    Returns:
+        (tile_path_str, success_bool)
+    """
+    tile_path_obj = Path(tile_path)
+    output_path = Path(output_dir)
+
+    try:
+        img = load_image(tile_path_obj)
+        mask_path = tile_path_obj.parent.parent / 'masks' / f"{tile_path_obj.stem}_mask.png"
+        mask = load_mask(mask_path)
+
+        if img is None or mask is None:
+            return (tile_path, False)
+
+        stem = tile_path_obj.stem
+        success = True
+
+        for transform_name, transform_fn in deterministic_transforms.items():
+            try:
+                if img.ndim == 3:
+                    aug_img = transform_fn(img)
+                else:
+                    aug_img = transform_fn(img[..., np.newaxis])
+
+                aug_mask = transform_fn(mask)
+
+                unique_vals = set(np.unique(aug_mask))
+                if not unique_vals.issubset({0, 255}):
+                    continue
+
+                img_out = output_path / 'images' / f"{stem}_{transform_name}.png"
+                mask_out = output_path / 'masks' / f"{stem}_{transform_name}_mask.png"
+                save_pair(aug_img, aug_mask, img_out, mask_out)
+
+            except Exception as e:
+                logger.error(f"Error applying {transform_name} to {stem}: {e}")
+                success = False
+
+        return (tile_path, success)
+
+    except Exception as e:
+        logger.error(f"Worker error processing {tile_path}: {e}")
+        return (tile_path, False)
+
+
 def scan_dataset(tiles_root: Path) -> Tuple[List[TileEntry], Dict[str, List[TileEntry]]]:
     catalog_a = []
     catalog_b = {'Esclerosado': [], 'Excluido': []}
@@ -273,27 +342,58 @@ def run_general_augmentation(
     catalog_a: List[TileEntry],
     output_root: Path,
     dry_run: bool = False,
+    num_workers: Optional[int] = None,
+    ram_fraction: float = 0.75,
+    min_free_gb: float = 1.0,
 ) -> Tuple[int, List[Dict], Dict[str, List[dict]]]:
     """
-    Apply 6 deterministic transforms and log originals.
+    Apply 6 deterministic transforms and log originals using dynamic parallel processing.
+    Uses memory-aware admission control: only submits new tasks if RAM budget allows.
 
     Returns:
         (number of new pairs, list of tile metadata, augmented entries by biopsia)
     """
-    logger.info(f"Component A: General augmentation ({len(catalog_a)} tiles)")
+    logger.info(f"Component A: General augmentation ({len(catalog_a)} tiles) with dynamic parallelism")
+
+    if dry_run:
+        logger.info("DRY RUN MODE - no files will be written")
+        return 0, [], {}
+
+    # Auto-detect worker count if not provided
+    if num_workers is None:
+        try:
+            from multiprocessing import cpu_count
+            num_workers = min(4, cpu_count())
+        except:
+            num_workers = 2
+
+    # Compute RAM budget ONCE at startup
+    try:
+        import psutil
+        available_gb = psutil.virtual_memory().available / (1024 ** 3)
+    except ImportError:
+        available_gb = 8.0
+
+    ram_budget_gb = available_gb * ram_fraction
+    logger.info(f"RAM budget: {available_gb:.2f}GB available, using {ram_budget_gb:.2f}GB ({ram_fraction*100:.0f}%) with {min_free_gb}GB safety margin")
+    logger.info(f"Starting Component A with {num_workers} workers, {len(catalog_a)} tiles\n")
 
     generated = 0
     tile_log = []
     augmented_entries = {}
+    success_count = 0
+    failed_count = 0
+    completed = 0
 
-    for entry in tqdm(catalog_a, desc="General augmentation"):
-        img = load_image(entry.img_path)
-        mask = load_mask(entry.mask_path)
+    # Build task deque with memory estimates
+    tasks = deque()
+    task_memory_estimates: Dict[str, float] = {}
 
-        if img is None or mask is None:
-            continue
-
+    for entry in catalog_a:
         output_dir = output_root / entry.biopsia
+        mem_est = _estimate_tile_memory_gb(entry.img_path)
+        tasks.append((entry, output_dir, mem_est))
+        task_memory_estimates[str(entry.img_path)] = mem_est
 
         tile_log.append({
             'stem': entry.stem,
@@ -306,35 +406,82 @@ def run_general_augmentation(
         if entry.biopsia not in augmented_entries:
             augmented_entries[entry.biopsia] = []
 
-        for transform_name, transform_fn in DETERMINISTIC_TRANSFORMS.items():
+    # Dynamic admission loop with ProcessPoolExecutor
+    used_ram_gb = 0.0
+    active_futures: Dict = {}  # Maps Future → (entry, mem_estimate)
+
+    def try_submit() -> None:
+        """Try to submit next task from queue if RAM budget allows."""
+        nonlocal used_ram_gb
+
+        while tasks:
+            entry, output_dir, mem_est = tasks[0]
+
+            # Dual RAM check: software counter AND live OS query
             try:
-                if img.ndim == 3:
-                    aug_img = transform_fn(img)
-                else:
-                    aug_img = transform_fn(img[..., np.newaxis])
+                import psutil
+                os_available = psutil.virtual_memory().available / (1024 ** 3)
+            except ImportError:
+                os_available = ram_budget_gb + min_free_gb
 
-                aug_mask = transform_fn(mask)
+            if used_ram_gb + mem_est <= ram_budget_gb and os_available > min_free_gb:
+                # Submit task
+                entry, output_dir, mem_est = tasks.popleft()
+                future = executor.submit(_augment_tile_worker, str(entry.img_path), str(output_dir), DETERMINISTIC_TRANSFORMS)
+                active_futures[future] = (entry, output_dir, mem_est)
+                used_ram_gb += mem_est
 
-                unique_vals = set(np.unique(aug_mask))
-                if not unique_vals.issubset({0, 255}):
-                    logger.warning(f"Invalid mask values: {unique_vals}")
-                    continue
+                logger.debug(f"Submitted {entry.stem}: RAM budget {used_ram_gb:.2f}GB / {ram_budget_gb:.2f}GB, OS available {os_available:.2f}GB")
+            else:
+                # Wait for running tasks to finish
+                break
 
-                if not dry_run:
-                    img_out = output_dir / 'images' / f"{entry.stem}_{transform_name}.png"
-                    mask_out = output_dir / 'masks' / f"{entry.stem}_{transform_name}_mask.png"
-                    save_pair(aug_img, aug_mask, img_out, mask_out)
+    start_time = time.time()
 
-                    aug_tile = build_augmented_tile_info(entry.tile_info, transform_name)
-                    aug_tile['image'] = f"images/{entry.stem}_{transform_name}.png"
-                    aug_tile['mask'] = f"masks/{entry.stem}_{transform_name}_mask.png"
-                    augmented_entries[entry.biopsia].append(aug_tile)
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        try_submit()
 
-                generated += 1
+        while active_futures:
+            done, _ = wait(active_futures, return_when=FIRST_COMPLETED)
 
-            except Exception as e:
-                logger.error(f"Error applying {transform_name}: {e}")
+            for future in done:
+                entry, output_dir, mem_est = active_futures.pop(future)
+                used_ram_gb -= mem_est
 
+                try:
+                    tile_path, success = future.result()
+
+                    if success:
+                        success_count += 1
+                        # Build augmented tile entries
+                        for transform_name in DETERMINISTIC_TRANSFORMS.keys():
+                            try:
+                                aug_tile = build_augmented_tile_info(entry.tile_info, transform_name)
+                                aug_tile['image'] = f"images/{entry.stem}_{transform_name}.png"
+                                aug_tile['mask'] = f"masks/{entry.stem}_{transform_name}_mask.png"
+                                augmented_entries[entry.biopsia].append(aug_tile)
+                                generated += 1
+                            except Exception as e:
+                                logger.error(f"Error building augmented entry for {entry.stem}_{transform_name}: {e}")
+
+                    else:
+                        failed_count += 1
+
+                    completed += 1
+
+                    if completed % 50 == 0:
+                        elapsed = time.time() - start_time
+                        logger.info(f"Tile {completed}/{len(catalog_a)} finished. RAM: {used_ram_gb:.2f}GB / {ram_budget_gb:.2f}GB. Success: {success_count}, Failed: {failed_count} ({elapsed:.1f}s)")
+
+                except Exception as e:
+                    logger.error(f"Task failed: {e}")
+                    failed_count += 1
+
+                # Try to admit next task after one finishes
+                try_submit()
+
+    elapsed = time.time() - start_time
+    logger.info(f"\n✓ Component A complete! {success_count}/{len(catalog_a)} tiles processed, {generated} pairs generated in {elapsed:.2f}s")
     logger.info(f"Component A: Generated {generated} new pairs, logged {len(tile_log)} originals")
     return generated, tile_log, augmented_entries
 
@@ -674,6 +821,24 @@ def main():
         action='store_true',
         help='Enable debug logging',
     )
+    parser.add_argument(
+        '--workers',
+        type=int,
+        default=None,
+        help='Number of parallel workers for Component A (default: auto-detect)',
+    )
+    parser.add_argument(
+        '--ram-fraction',
+        type=float,
+        default=0.75,
+        help='Fraction of available RAM to use for processing (default: 0.75)',
+    )
+    parser.add_argument(
+        '--min-free-gb',
+        type=float,
+        default=1.0,
+        help='Minimum free RAM to keep available (default: 1.0 GB)',
+    )
 
     args = parser.parse_args()
 
@@ -715,7 +880,14 @@ def main():
 
     n_base = copy_base_dataset(args.tiles_dir, output_root, overwrite=args.overwrite)
 
-    n_general, tile_log, augmented_a = run_general_augmentation(catalog_a, output_root, dry_run=args.dry_run)
+    n_general, tile_log, augmented_a = run_general_augmentation(
+        catalog_a,
+        output_root,
+        dry_run=args.dry_run,
+        num_workers=args.workers,
+        ram_fraction=args.ram_fraction,
+        min_free_gb=args.min_free_gb,
+    )
 
     if not args.dry_run:
         log_path = output_root / 'tile_originals.json'

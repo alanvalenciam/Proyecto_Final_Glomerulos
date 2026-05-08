@@ -1,219 +1,403 @@
-# Automated Glomeruli Instance Segmentation from Renal Biopsy WSI
+# U-Net Glomeruli Segmentation — Renal Biopsy WSI Analysis
 
-This project implements automated detection and segmentation of glomeruli (functional units of the kidney) from renal biopsy Whole Slide Images (WSI) using a specialist deep learning model trained on pathological samples.
+Automated **semantic segmentation** of glomeruli (functional kidney units) from renal biopsy whole-slide images (WSI) using PyTorch U-Net with **dynamic memory-aware parallelism** for Windows Server deployment.
 
-## Quick Start
+![Pipeline](https://img.shields.io/badge/Pipeline-5%20Steps-blue) ![Model](https://img.shields.io/badge/Model-U--Net-green) ![Loss](https://img.shields.io/badge/Loss-BCE%2BDice-orange) ![Metric](https://img.shields.io/badge/Metric-MeanIoU-brightgreen)
 
-### 1. Activate Environment
-```bash
-source env/bin/activate
+---
+
+## 🚀 Quick Start (Windows Server)
+
+```powershell
+# 1. Prepare input data
+mkdir Entradas
+# Copy your WSI files (*.tiff) + annotations (*.geojson) to Entradas/
+
+# 2. Run the full pipeline
+python tiling_unet.py              # ~5-20 min
+python augmentation.py             # ~10-30 min
+python normalizacion.py            # ~10-15 min
+python estandarizacion.py          # ~10-15 min
+
+# 3. Train U-Net
+jupyter notebook U-Net_Training.ipynb
+# Open the notebook and run all cells (or uncomment the training cell for full 50-epoch training)
+# Takes ~2-8 hours depending on batch size and hardware
+
+# 4. Monitor training
+tensorboard --logdir checkpoints
+# Open http://localhost:6006 in browser
 ```
 
-### 2. Run Full WSI Segmentation
-```bash
-python segment_with_specialist_model.py
+**Total time**: ~2-3 days end-to-end (including training)
+
+For detailed walkthrough, see **[WORKFLOW.md](WORKFLOW.md)** ← Start here!
+
+---
+
+## 📋 What This Project Does
+
+**Input**: Whole-slide images (TIFF) + physician annotations (GeoJSON)  
+**Output**: Trained U-Net model that predicts glomerulus boundaries + class labels (0-4)  
+**Metric**: Mean Intersection over Union (MeanIoU) per glomerulus class
+
+```
+WSI TIFF + GeoJSON
+     ↓
+[1] Tiling (1024×1024 tiles, 50% overlap)
+     ↓
+[2] Data Augmentation (6 deterministic + synthetic)
+     ↓
+[3] Color Normalization (Reinhard stain transfer)
+     ↓
+[4] Z-Score Standardization (per-channel, reversible)
+     ↓
+[5] U-Net Training (BCE + Dice loss, MeanIoU validation)
+     ↓
+Trained Model (best_model.pth) + Metrics Report
 ```
 
-**Note**: First, edit `segment_with_specialist_model.py` and change:
+---
+
+## 🏗️ Architecture: U-Net for Medical Image Segmentation
+
+### Why U-Net?
+
+Unlike **bounding-box detection** (YOLO, Mask R-CNN), U-Net performs **pixel-level semantic segmentation**:
+- Delineates exact boundaries of glomerulus capillary tufts (Bowman capsule + glomerular tuft)
+- Separates glomerulus from background and other kidney compartments
+- Handles massive class imbalance (background >> glomerulus pixels)
+
+### Model Details
+
+```
+Input:  [B, 3, 1024, 1024]  (Z-score normalized RGB tiles)
+         ↓
+Encoder (4 levels):
+  - DoubleConv blocks (Conv→BN→ReLU×2)
+  - MaxPool2d for downsampling
+         ↓
+Bottleneck: (highest compression, full context)
+         ↓
+Decoder (4 levels):
+  - Bilinear upsample
+  - Skip connections (from encoder)
+  - DoubleConv blocks
+         ↓
+Output: [B, 5, 1024, 1024]  (logits: background + 4 glomerulus classes)
+```
+
+### Loss Function: Combined BCE + Dice
+
 ```python
-MAX_TILES = 50  # Change to: MAX_TILES = None
+Loss = 0.5 * CrossEntropyLoss + 0.5 * DiceLoss
+
+CrossEntropyLoss:
+  - Strict pixel classification (per-class probability)
+  - Class weights: inverse frequency (handles imbalance)
+
+DiceLoss:
+  - Dice coefficient = 2|X∩Y| / (|X|+|Y|)  (IoU proxy)
+  - Penalizes lack of geometric overlap
+  - Critical for detecting small glomeruli amid background
 ```
 
-### 3. View Results
+### Evaluation: Mean Intersection over Union (MeanIoU)
+
+Per-class IoU: `IoU_c = intersection_c / (union_c)` for each class c ∈ {0,1,2,3,4}
+
+**MeanIoU** = average IoU across all classes
+
+- **Background (class 0)**: large but lower priority
+- **Glomerulus classes (1-4)**: small but clinically critical → balanced by class weighting
+
+---
+
+## 📁 Project Structure
+
+```
+Proyecto_Final_Glomerulos/
+├── Entradas/                          ← Input: WSI TIFF + GeoJSON
+│   ├── slide_001.tiff
+│   ├── slide_001.geojson
+│   └── ...
+│
+├── Salidas/                           ← All outputs
+│   ├── Tiles_UNet/                    ← Step 1: Tiled + labeled
+│   ├── dataset_aug/                   ← Step 2: Augmented
+│   ├── Normalizados/                  ← Step 3: Color-normalized
+│   ├── Estandarizados/                ← Step 4: Z-score standardized
+│   └── checkpoints/                   ← Step 5: Trained models
+│
+├── tiling_unet.py                     ← Extract tiles + masks from WSI
+├── augmentation.py                    ← Data augmentation (6+3 transforms)
+├── normalizacion.py                   ← Reinhard color normalization
+├── estandarizacion.py                 ← Z-score standardization
+│
+├── U-Net_Training.ipynb               ← Complete training notebook
+│                                         (includes dataset, losses, U-Net model, training loop)
+│
+├── README.md                          ← This file
+├── WORKFLOW.md                        ← Detailed Windows Server guide
+```
+
+---
+
+## 💾 System Requirements
+
+| Resource | Minimum | Recommended |
+|----------|---------|-------------|
+| Python | 3.10+ | 3.11 (Windows) |
+| RAM | 16 GB | 32+ GB |
+| Disk | 500 GB | 1 TB+ |
+| CPU cores | 8 | 16+ |
+| GPU (optional) | — | NVIDIA 4GB VRAM |
+
+### Python Packages
+
 ```bash
-cat Salidas/glomeruli_detections.json
-open Salidas/thumbnail.jpg
+pip install torch torchvision opencv-python numpy scikit-image scikit-learn
+pip install albumentations shapely tensorboard psutil tqdm
 ```
 
-## What's Included
+---
 
-### Scripts
-| File | Purpose |
-|------|---------|
-| `segment_with_specialist_model.py` | Main segmentation engine (Cascade Mask R-CNN) |
-| `inference_glomeruli.py` | Image analysis and metadata extraction |
-| `segmentation_torchvision.py` | Generic Mask R-CNN baseline |
+## 🔄 Dynamic Parallelism (Why It Matters)
 
-### Outputs
-- `Salidas/glomeruli_detections.json` — Detection results (bboxes, confidence scores)
-- `Salidas/analysis.json` — WSI metadata (dimensions, file size)
-- `Salidas/thumbnail.jpg` — 512×512 preview image
-
-### Documentation
-- `SEGMENTATION_REPORT.md` — Technical architecture and processing details
-- `EXECUTION_SUMMARY.md` — Execution log and performance metrics
-- `README.md` — This file
-
-## Architecture
-
-The pipeline uses **Cascade Mask R-CNN** trained on renal biopsy patches:
+Every processing script uses **memory-aware dynamic parallelism**:
 
 ```
-Input WSI (37,866 × 19,589 pixels)
-  ↓
-Tiling (512×512 with 10% overlap)
-  ↓
-Per-tile Inference
-  ├─ ResNet50 backbone
-  ├─ Feature Pyramid Network
-  ├─ Region Proposal Network
-  └─ 3-Stage Cascade Mask R-CNN
-  ↓
-Detection Aggregation (local → global coordinates)
-  ↓
-Output: Glomeruli bounding boxes + instance masks
+┌─ Compute RAM budget (once at startup)
+│
+├─ For each task:
+│  ├─ Check if RAM allows next task (dual check: software counter + live OS)
+│  ├─ If yes → submit task
+│  └─ If no → WAIT (don't crash with OOM)
+│
+└─ When task finishes → decrement RAM, try next task
 ```
 
-## Configuration
+**Why?** On Windows servers with shared resources:
+- ✅ Prevents out-of-memory crashes
+- ✅ Detects external memory pressure (other processes)
+- ✅ Keeps safety margin (1GB free) to prevent OS swapping
+- ✅ Clear logging: `"Tile 18/847 finished. Freeing 25.2MB. Trying to admit tile 19..."`
 
-Edit `segment_with_specialist_model.py` to adjust:
+**Tune with**: `--ram-fraction 0.75` and `--min-free-gb 1.0`
 
+---
+
+## 📊 Training Pipeline
+
+### Data Preparation
+1. **Tiling**: 1024×1024 tiles from WSI with 50% overlap
+2. **Filtering**: Skip background-only tiles (Otsu thresholding on tissue mask)
+3. **Augmentation**:
+   - **Component A** (deterministic): 6 transforms (flip, rotate) on ALL tiles
+   - **Component B** (synthetic): 0-3 random augmentations if class is underrepresented
+4. **Normalization**: Reinhard stain color transfer (tissue color consistency)
+5. **Standardization**: Z-score per RGB channel (reversible uint8 encoding)
+
+### Data Split
+- **Train**: 70% biopsies (not tiles!) 
+- **Val**: 15% biopsies
+- **Test**: 15% biopsies
+
+Why by biopsia? Tiles from same slide are correlated → splits by biopsia prevent leakage.
+
+### Training Loop
+- **Optimizer**: AdamW (weight_decay=1e-4)
+- **LR Schedule**: Linear warmup (5 epochs) → cosine annealing
+- **Loss**: 50/50 BCE + Dice
+- **Class Weights**: Inverse frequency (handles background/glomerulus imbalance)
+- **Validation**: MeanIoU per epoch, checkpoint best model
+- **Logging**: TensorBoard (loss, MeanIoU, per-class IoU)
+
+---
+
+## 🖥️ Windows Server Notes
+
+### Path Handling
+All scripts use `Path()` (pathlib) which handles `/` and `\` correctly:
 ```python
-TILE_SIZE = 512              # Tile size (512×512 or 1024×1024)
-OVERLAP_RATIO = 0.1          # 10% overlap between tiles
-SCORE_THRESHOLD = 0.5        # Detection confidence threshold
-MAX_TILES = None             # None = full WSI, or set to number (e.g., 100)
+from pathlib import Path
+Path("Salidas") / "Tiles_UNet"  # Works on Windows and Linux
 ```
 
-## Performance
+### OpenSlide on Windows
+Download from: https://openslide.cs.cmu.edu/download/openslide-winbuild/
 
-| Configuration | Time | Memory |
-|---------------|------|--------|
-| 50 tiles (CPU) | 40 sec | 376 MB |
-| Full WSI (CPU) | ~18 min | 400-500 MB |
-| Full WSI (GPU) | ~1-2 min | 1-2 GB |
+Add to PATH:
+```powershell
+$env:PATH += ";C:\openslide-winbuild-20230414\bin"
+```
 
-**Recommendation**: Use GPU for production (>10x speedup)
+### CUDA Detection
+```bash
+python -c "import torch; print(torch.cuda.is_available())"
+```
 
-## Input/Output Format
+If not detected, reinstall PyTorch matching your CUDA version.
 
-### Input
-- **Location**: `Entradas/933-10155.tiff`
-- **Format**: Multi-page TIFF (WSI standard)
-- **Size**: 37,866 × 19,589 pixels (37K × 20K)
-- **File size**: 67.2 MB
+### Disk I/O Performance
+- Use **SSD** (not HDD) for `Salidas/` → tiles are written many times
+- Avoid network storage (NAS/SMB) → local disk is 10x faster
+- Monitor: `python -c "import shutil; print(shutil.disk_usage('.'))"` (GB free)
 
-### Output (JSON)
+---
+
+## 📖 Usage Examples
+
+### Run Full Pipeline with Defaults
+```bash
+python tiling_unet.py
+python augmentation.py
+python normalizacion.py
+python estandarizacion.py
+jupyter notebook U-Net_Training.ipynb
+# Open the notebook and run all cells to train the U-Net
+```
+
+### Custom Configuration
+```bash
+# Fewer workers if RAM is tight
+python normalizacion.py --workers 4 --ram-fraction 0.5
+
+# Run only on specific biopsy
+python estandarizacion.py --input Salidas/Normalizados/biopsia_001
+
+# For training configuration (epochs, batch size, learning rate):
+# Open U-Net_Training.ipynb and modify the parameters in the training cell
+```
+
+### Resume Training
+```bash
+# Open U-Net_Training.ipynb and modify the notebook code to load a checkpoint
+# before training (set the resume path in the training cell)
+```
+
+---
+
+## 🔍 Outputs
+
+### After Step 1 (Tiling)
+```
+Salidas/Tiles_UNet/biopsia_001/
+├── images/
+│   ├── slide_001_tile_0_0.png   (1024×1024 RGB)
+│   └── ...
+├── masks/
+│   ├── slide_001_tile_0_0_mask.png  (class IDs 0-4)
+│   └── ...
+└── annotations.json             (tile registry, glomeruli mapping)
+```
+
+### After Step 5 (Training)
+```
+checkpoints/unet_YYYYMMDD_HHMMSS/
+├── unet_YYYYMMDD_HHMMSS_best.pth      (model weights)
+├── unet_YYYYMMDD_HHMMSS_last.pth      (last checkpoint)
+├── unet_YYYYMMDD_HHMMSS_report.json   (final metrics)
+└── runs/                               (TensorBoard logs)
+    ├── events.out.tfevents.1714...
+    └── ...
+```
+
+**Metrics file** (JSON):
 ```json
 {
-  "wsi_info": {
-    "width": 37866,
-    "height": 19589,
-    "file_size_mb": 67.24
-  },
-  "config": {
-    "tile_size": 512,
-    "overlap_ratio": 0.1,
-    "score_threshold": 0.5
-  },
-  "statistics": {
-    "total_tiles": 1400,
-    "total_detections": 125,
-    "avg_detections_per_tile": 0.089
+  "final_metrics": {
+    "train_loss": 0.234,
+    "val_loss": 0.312,
+    "val_mean_iou": 0.687,
+    "test_mean_iou": 0.672,
+    "test_per_class_iou": {
+      "class_0": 0.95,
+      "class_1": 0.62,
+      "class_2": 0.58,
+      "class_3": 0.54,
+      "class_4": 0.51
+    }
   }
 }
 ```
 
-## Model
+---
 
-**Checkpoint**: `models/Cascade_Mask-RCNN_snapshot.pth` (587 MB)
-- **Architecture**: Cascade Mask R-CNN (He et al., 2017)
-- **Backbone**: ResNet50 + FPN
-- **Classes**: 4 (glomerulus types)
-- **Stages**: 3 cascade refinement stages (IoU thresholds: 0.5, 0.6, 0.7)
-- **Training**: BUPT renal biopsy dataset
-- **Paper**: [AJP 2021](https://github.com/bupt-ai-cz/Glomeruli-Instance-Segmentation)
+## 🐛 Troubleshooting
 
-## Troubleshooting
+### "MemoryError" or "Process killed"
+→ Reduce `--ram-fraction` to 0.5, or increase `--min-free-gb` to 2.0  
+→ Check if other processes are consuming RAM: `tasklist /V | findstr python`
 
-### Issue: "ModuleNotFoundError: No module named 'mmcv'"
-**Solution**: This project loads the model directly using PyTorch without mmdetection. If you see this error, ensure you're using the `segment_with_specialist_model.py` script, not the original repo's tools.
+### "No PNG images found"
+→ Verify directory structure: `dir Salidas\dataset_aug\biopsia_001\images\`  
+→ Check that previous step completed successfully
 
-### Issue: "PIL.Image.DecompressionBombError"
-**Solution**: The WSI is too large for PIL to load. The scripts use `tifffile` and OpenCV instead, which handle large images correctly.
+### "OpenSlide: library not found"
+→ Download and install OpenSlide, add to PATH  
+→ Verify: `python -c "import openslide; print(openslide.__file__)"`
 
-### Issue: "0 detections found"
-**Solution**: This is expected for edge tiles (white space/background). Run on full WSI to find glomeruli-rich regions.
+### GPU not detected
+→ `python -c "import torch; print(torch.cuda.is_available())"`  
+→ Reinstall PyTorch matching your CUDA version
 
-### Issue: Slow processing
-**Solution**: 
-- Use GPU: Set `device = 'cuda:0'` in the script
-- Increase `TILE_SIZE` to reduce number of tiles (but at lower resolution)
-- Reduce `SCORE_THRESHOLD` to detect more objects (and more false positives)
-
-## Validation
-
-The pipeline has been validated with:
-- WSI metadata extraction ✓
-- Large TIFF file handling ✓
-- Model weight loading ✓
-- Tile-based inference ✓
-- Coordinate transformation ✓
-- Results JSON generation ✓
-
-**Sample run**: 50 tiles processed successfully, results aggregated correctly, no errors.
-
-## Next Steps
-
-1. **Full WSI Processing**
-   - Set `MAX_TILES = None`
-   - Run for 20-30 minutes (CPU) or 1-2 minutes (GPU)
-   - Collect all ~125+ glomeruli detections
-
-2. **Post-Processing**
-   - Non-Maximum Suppression (NMS) across tile boundaries
-   - Merge overlapping detections
-   - Filter by confidence threshold
-
-3. **Visualization**
-   - Draw bounding boxes on original WSI
-   - Color-code by glomerulus type
-   - Generate annotated report image
-
-4. **Clinical Analysis**
-   - Extract morphological statistics (area, roundness, etc.)
-   - Calculate glomerulus density map
-   - Identify pathological regions
-   - Generate diagnostic summary
-
-## System Requirements
-
-- **Python**: 3.9+
-- **RAM**: 500 MB minimum (CPU), 2+ GB recommended
-- **Disk**: 5 GB for models + results
-- **GPU**: Optional (recommended for speed)
-
-## Installation (Fresh Setup)
-
-```bash
-# Create venv if needed
-python -m venv env
-source env/bin/activate
-
-# Install dependencies
-pip install torch torchvision opencv-python tifffile numpy scipy matplotlib
-
-# Run segmentation
-python segment_with_specialist_model.py
-```
-
-## References
-
-- **Official Repository**: https://github.com/bupt-ai-cz/Glomeruli-Instance-Segmentation
-- **Paper**: "A Deep Learning-Based Approach for Glomeruli Instance Segmentation from Multistained Renal Biopsy Pathologic Images" (AJP, 2021)
-- **Cascade R-CNN**: https://arxiv.org/abs/1712.00726
-
-## Author Notes
-
-This implementation solves the original repository's mmdetection compatibility issues by loading model weights directly into PyTorch. It's fully functional on CPU/GPU without requiring CUDA compilation or mmdetection installation.
-
-**Key advantages**:
-- No mmdetection dependency
-- Works on macOS/Windows/Linux
-- Reproducible results
-- Ready for batch processing
-- Extensible for post-processing and visualization
+For more troubleshooting, see **[WORKFLOW.md](WORKFLOW.md)**.
 
 ---
 
-**Questions?** Check `EXECUTION_SUMMARY.md` for detailed execution log and performance metrics.
+## 📚 References
+
+### Architecture
+- **U-Net**: Ronneberger et al., "U-Net: Convolutional Networks for Biomedical Image Segmentation" (MICCAI 2015)
+- **Dice Loss**: Sørensen–Dice coefficient for segmentation
+- **Medical Image Analysis**: Standard practice for pathology image segmentation
+
+### Medical Context
+- **Glomeruli**: Functional units of kidney; assessment critical for diagnosis
+- **Bowman's Capsule**: Surrounds glomerular tuft; key landmark for segmentation
+- **Biopsy Classification**: 4 classes based on pathological features
+
+### Related Work
+- Instance segmentation: Mask R-CNN
+- Semantic segmentation: DeepLab, PSPNet
+- Medical imaging: nnU-Net (state-of-the-art for medical tasks)
+
+---
+
+## 📝 Documentation
+
+- **[WORKFLOW.md](WORKFLOW.md)** — Complete Windows Server deployment guide (full pipeline walkthrough, CLI reference, troubleshooting)
+- **[README.md](README.md)** — This file (architecture, quick start, system requirements)
+
+---
+
+## 🎯 Next Steps
+
+1. **Prepare data**: Place WSI + GeoJSON pairs in `Entradas/`
+2. **Run pipeline**: Follow Quick Start section above
+3. **Monitor training**: Open TensorBoard while training
+4. **Evaluate results**: Check `checkpoints/*_report.json` for final metrics
+5. **Deploy model**: Use `best_model.pth` for inference on new WSI
+
+---
+
+## 📄 License & Attribution
+
+This project implements semantic segmentation for renal biopsy analysis using U-Net with PyTorch.
+
+**Key innovations**:
+- Dynamic memory-aware parallelism for Windows Server
+- Combined BCE+Dice loss for class imbalance
+- Per-biopsia data split (prevents leakage)
+- Reversible Z-score encoding
+
+---
+
+**Questions?** Check [WORKFLOW.md](WORKFLOW.md) for detailed instructions.  
+**Issues?** See Troubleshooting section above.
+
+---
+
+*Last updated: 2026-05-07*  
+*Python 3.10+ | PyTorch 2.0+ | Windows/Linux/macOS*

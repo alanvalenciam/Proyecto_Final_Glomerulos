@@ -25,8 +25,11 @@ import json
 import logging
 import multiprocessing
 import random
+import shutil
 from pathlib import Path
-from typing import Tuple
+from typing import Tuple, Dict
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from collections import deque
 
 import cv2
 import numpy as np
@@ -260,25 +263,37 @@ def calculate_optimal_workers(avg_tile_size_mb: float = 3.0) -> int:
     return workers
 
 
+def _estimate_tile_memory_gb(tile_path: Path) -> float:
+    """Estima RAM necesario para un tile: file_size × 8 (uint8→float32 + procesamiento)."""
+    if tile_path.exists():
+        size_mb = tile_path.stat().st_size / (1024 ** 2)
+        return (size_mb * 8) / 1024.0
+    return 0.05
+
+
 def process_folder(
     input_dir: Path,
     output_dir: Path,
     workers: int = None,
     n_samples: int = 200,
     rebuild: bool = False,
+    ram_fraction: float = 0.75,
+    min_free_gb: float = 1.0,
 ):
-    """Orquesta el procesamiento de todos los tiles."""
+    """Procesa tiles con paralelismo dinámico (control de admisión basado en RAM)."""
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
 
     if not input_dir.exists():
         raise ValueError(f"Directorio de entrada no existe: {input_dir}")
 
-    tile_paths = sorted(input_dir.rglob("*.png"))
-    logger.info(f"Total de tiles a procesar: {len(tile_paths)}")
+    all_paths = sorted(input_dir.rglob("*.png"))
+    image_paths = [p for p in all_paths if not p.name.endswith('_mask.png')]
+    mask_paths = [p for p in all_paths if p.name.endswith('_mask.png')]
+    logger.info(f"Total: {len(image_paths)} imágenes + {len(mask_paths)} máscaras")
 
-    if len(tile_paths) == 0:
-        logger.warning("No se encontraron tiles PNG. Nada que hacer.")
+    if len(image_paths) == 0:
+        logger.warning("No se encontraron tiles PNG (excluidas máscaras). Nada que hacer.")
         return
 
     means, stds = load_or_compute_stats(input_dir, n_samples, rebuild)
@@ -286,36 +301,101 @@ def process_folder(
     if workers is None:
         workers = calculate_optimal_workers()
 
-    tile_args = []
-    for tile_path in tile_paths:
+    # Construir lista de tareas con estimaciones de memoria
+    tasks = deque()
+    task_memory_estimates: Dict = {}
+
+    for tile_path in image_paths:
         rel_path = tile_path.relative_to(input_dir)
         output_path = (output_dir / rel_path).with_suffix(".png")
-        tile_args.append((tile_path, output_path, means, stds))
+        task_tuple = (tile_path, output_path, means, stds)
+        mem_est = _estimate_tile_memory_gb(tile_path)
+        tasks.append(task_tuple)
+        task_memory_estimates[str(tile_path)] = mem_est
+
+    # Presupuesto de RAM (calculado una sola vez al inicio)
+    available_gb = psutil.virtual_memory().available / (1024 ** 3)
+    ram_budget_gb = available_gb * ram_fraction
+    logger.info(f"Presupuesto RAM: {available_gb:.2f}GB disponible, usando {ram_budget_gb:.2f}GB ({ram_fraction*100:.0f}%) con {min_free_gb}GB margen seguridad")
+
+    logger.info(f"Iniciando procesamiento dinámico con {workers} workers, {len(image_paths)} tiles...")
 
     processed = 0
     failed = 0
+    used_ram_gb = 0.0
+    active_futures: Dict = {}  # Future → (tile_path_str, memory_estimate)
 
-    logger.info(f"Iniciando procesamiento con {workers} workers...")
+    def try_submit() -> None:
+        """Intenta enviar siguiente tarea si presupuesto de RAM lo permite."""
+        nonlocal used_ram_gb
+        while tasks:
+            task = tasks[0]
+            tile_path_str = str(task[0])
+            mem_est = task_memory_estimates[tile_path_str]
 
-    with multiprocessing.Pool(workers) as pool:
-        for tile_path_str, success in pool.imap_unordered(
-            process_single_tile, tile_args, chunksize=10
-        ):
-            if success:
-                processed += 1
+            # Doble chequeo RAM: contador software + consulta OS en vivo
+            os_available = psutil.virtual_memory().available / (1024 ** 3)
+
+            if used_ram_gb + mem_est <= ram_budget_gb and os_available > min_free_gb:
+                # Enviar tarea
+                task = tasks.popleft()
+                future = executor.submit(process_single_tile, task)
+                active_futures[future] = (tile_path_str, mem_est)
+                used_ram_gb += mem_est
             else:
-                failed += 1
+                # Esperar a que terminen tareas en ejecución
+                break
 
-            if (processed + failed) % 50 == 0:
-                logger.info(
-                    f"Progreso: {processed + failed}/{len(tile_paths)} "
-                    f"({processed} OK, {failed} fallos)"
-                )
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        try_submit()
+
+        while active_futures:
+            done, _ = wait(active_futures, return_when=FIRST_COMPLETED)
+
+            for future in done:
+                tile_path_str, mem_est = active_futures.pop(future)
+                used_ram_gb -= mem_est
+
+                try:
+                    tile_path_result, success = future.result()
+                    if success:
+                        processed += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    logger.error(f"Tarea falló: {e}")
+                    failed += 1
+
+                if (processed + failed) % 50 == 0:
+                    logger.info(
+                        f"Progreso: {processed + failed}/{len(image_paths)} "
+                        f"({processed} OK, {failed} fallos)"
+                    )
+
+                # Intentar enviar siguiente tarea después de que una termine
+                try_submit()
 
     logger.info(
-        f"Procesamiento completado: {processed}/{len(tile_paths)} tiles "
-        f"({failed} fallos)"
+        f"✓ Procesamiento de imágenes completado: {processed}/{len(image_paths)} tiles "
     )
+
+    # Copiar máscaras sin transformar (son labels 0-4, no se estandarizan)
+    logger.info(f"Copiando {len(mask_paths)} máscaras sin transformación...")
+    copied = 0
+    failed = 0
+    for mask_path in mask_paths:
+        try:
+            rel_path = mask_path.relative_to(input_dir)
+            output_path = output_dir / rel_path
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(mask_path, output_path)
+            copied += 1
+        except Exception as e:
+            logger.error(f"Error copiando {mask_path}: {e}")
+            failed += 1
+
+    logger.info(f"✓ Máscaras copiadas: {copied}/{len(mask_paths)} ({failed} fallos)")
+    logger.info(f"✓ Procesamiento completado: {processed + copied}/{len(image_paths) + len(mask_paths)} archivos totales")
     logger.info(f"Tiles estandarizados guardados en: {output_dir}")
 
 
@@ -352,6 +432,18 @@ def main():
         action="store_true",
         help="Recalcular estadísticas aunque el caché exista",
     )
+    parser.add_argument(
+        "--ram-fraction",
+        type=float,
+        default=0.75,
+        help="Fracción de RAM disponible para usar (0.0-1.0, default: 0.75)",
+    )
+    parser.add_argument(
+        "--min-free-gb",
+        type=float,
+        default=1.0,
+        help="Mínimo GB de RAM libre a mantener (default: 1.0)",
+    )
 
     args = parser.parse_args()
 
@@ -361,6 +453,8 @@ def main():
         workers=args.workers,
         n_samples=args.n_samples,
         rebuild=args.rebuild,
+        ram_fraction=args.ram_fraction,
+        min_free_gb=args.min_free_gb,
     )
 
 
