@@ -1,32 +1,14 @@
 #!/usr/bin/env python3
-"""
-Reconstruct WSI from annotated tiles (tiling_anotaciones.py output).
-
-Reads annotations.json from Salidas/Tiles_UNet/{slide_name}/ and reconstructs:
-1. Downsampled full WSI image
-2. Binary segmentation mask (white=glomerulo, black=background)
-3. Overlay blend (image + mask at 70/30)
-
-Dynamic workers: if --workers not specified, adapts parallelism based on available memory.
-Never exceeds specified --mem-percent (default 70%) of total system RAM.
-
-Usage:
-    python reconstruct_slide.py                                # Process all slides (default)
-    python reconstruct_slide.py BR-129-PAS-24-CONV --scale 10 # Process one slide
-    python reconstruct_slide.py --workers 4                     # All slides, 4 fixed workers
-    python reconstruct_slide.py --mem-percent 60                # All slides, max 60% RAM
-"""
+"""Reconstruct WSI from annotated tiles (tiling_anotaciones.py output)."""
 
 import argparse
 import json
-import time
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed, wait
 from typing import Optional, Tuple
 import os
 
-import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 from tqdm import tqdm
 
 try:
@@ -35,21 +17,11 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
-try:
-    import openslide
-    HAS_OPENSLIDE = True
-except ImportError:
-    HAS_OPENSLIDE = False
-
 
 class MemoryMonitor:
     """Monitor memory usage and adapt worker count dynamically."""
 
     def __init__(self, mem_percent: int = 80):
-        """
-        Args:
-            mem_percent: Max % of total system RAM to use (default 80 for 28 GB)
-        """
         self.mem_percent = mem_percent
         self.total_memory = psutil.virtual_memory().total if HAS_PSUTIL else 16 * 1024**3
         self.max_allowed = (self.total_memory * mem_percent) // 100
@@ -80,7 +52,6 @@ class MemoryMonitor:
 
         available = self.get_available_memory()
         avg_slide_memory = sum(self.slide_memory_cache.values()) / len(self.slide_memory_cache) if self.slide_memory_cache else 500 * 1024**2
-        # Estimate: how many slides of avg_slide_memory fit in max_allowed?
         max_workers = max(1, (self.max_allowed // int(avg_slide_memory)))
         return min(max(1, available // (avg_slide_memory * 1.2)), max_workers)
 
@@ -95,68 +66,13 @@ def load_annotations(annotations_path: Path) -> dict:
         return json.load(f)
 
 
-def load_wsi_image(image_path: str, image_format: str, target_size: Optional[Tuple[int, int]] = None) -> Image.Image:
-    """
-    Load WSI image, optionally at a target size.
-
-    Args:
-        image_path: Path to WSI file
-        image_format: 'pil' or 'openslide'
-        target_size: (width, height) for thumbnail; None = full resolution
-
-    Returns:
-        PIL.Image in RGB mode
-    """
-    path = Path(image_path)
-
-    if not path.exists():
-        raise FileNotFoundError(f"Image not found: {image_path}")
-
-    if image_format == 'openslide' and HAS_OPENSLIDE:
-        try:
-            slide = openslide.open_slide(image_path)
-            if target_size:
-                img = slide.get_thumbnail(target_size)
-            else:
-                w, h = slide.dimensions
-                img = slide.get_thumbnail((w, h))
-            return img.convert('RGB')
-        except Exception as e:
-            print(f"  OpenSlide failed ({e}), falling back to PIL")
-
-    img = Image.open(image_path)
-    if img.mode != 'RGB':
-        img = img.convert('RGB')
-
-    if target_size:
-        img = img.resize(target_size, Image.LANCZOS)
-
-    return img
-
-
-def scale_polygon(polygon: list, scale: float) -> list:
-    """Scale polygon coordinates by dividing by scale factor."""
-    return [(int(x / scale), int(y / scale)) for x, y in polygon]
-
-
 def reconstruct_slide(
     slide_name: str,
     input_dir: Path = Path('Salidas/Tiles_UNet'),
     output_dir: Optional[Path] = None,
     recon_scale: int = 10,
 ) -> Tuple[bool, str, int]:
-    """
-    Reconstruct a single slide by pasting tiles at their native coordinates.
-
-    Args:
-        slide_name: e.g., 'BR-129-PAS-24-CONV'
-        input_dir: Directory containing {slide_name}/ subdirs
-        output_dir: Where to create reconstructions/; if None, use input_dir
-        recon_scale: Downsample factor for final output
-
-    Returns:
-        Tuple[success, message, memory_used_bytes]
-    """
+    """Reconstruct a single slide by pasting tiles at their native coordinates."""
     if output_dir is None:
         output_dir = input_dir
 
@@ -180,38 +96,45 @@ def reconstruct_slide(
     if native_width == 0 or native_height == 0:
         return False, "Invalid native dimensions", 0
 
-    # Create canvas at native resolution first
-    wsi_img = Image.new('RGB', (native_width, native_height), (255, 255, 255))
-    mask_img = Image.new('L', (native_width, native_height), 0)
-
-    # Paste each tile at its native position
-    for tile_data in tiles:
-        image_path = slide_dir / tile_data.get('image', '')
-        mask_path = slide_dir / tile_data.get('mask', '')
-        origin = tile_data.get('origin_native', [0, 0])
-
-        # Paste image tile
-        if image_path.exists():
-            try:
-                tile_img = Image.open(image_path).convert('RGB')
-                wsi_img.paste(tile_img, tuple(origin))
-            except Exception:
-                pass
-
-        # Paste mask tile
-        if mask_path.exists():
-            try:
-                tile_mask = Image.open(mask_path).convert('L')
-                mask_img.paste(tile_mask, tuple(origin))
-            except Exception:
-                pass
-
-    # Scale down to reduce file size
+    # Skip native allocation — too memory-hungry for gigapixel images
     canvas_width = max(1, native_width // recon_scale)
     canvas_height = max(1, native_height // recon_scale)
 
-    wsi_scaled = wsi_img.resize((canvas_width, canvas_height), Image.LANCZOS)
-    mask_scaled = mask_img.resize((canvas_width, canvas_height), Image.NEAREST)
+    wsi_img = Image.new('RGB', (canvas_width, canvas_height), (255, 255, 255))
+    mask_img = Image.new('L', (canvas_width, canvas_height), 0)
+
+    for tile_data in tiles:
+        image_path = slide_dir / tile_data.get('image', '')
+        mask_path = slide_dir / tile_data.get('mask', '')
+        origin_native = tile_data.get('origin_native', [0, 0])
+
+        scaled_x = origin_native[0] // recon_scale
+        scaled_y = origin_native[1] // recon_scale
+        scaled_origin = (scaled_x, scaled_y)
+
+        if image_path.exists():
+            try:
+                tile_img = Image.open(image_path).convert('RGB')
+                tile_w_scaled = max(1, tile_img.width // recon_scale)
+                tile_h_scaled = max(1, tile_img.height // recon_scale)
+                tile_img_scaled = tile_img.resize((tile_w_scaled, tile_h_scaled), Image.LANCZOS)
+                wsi_img.paste(tile_img_scaled, scaled_origin)
+            except Exception:
+                pass
+
+        if mask_path.exists():
+            try:
+                tile_mask = Image.open(mask_path).convert('L')
+                tile_w_scaled = max(1, tile_mask.width // recon_scale)
+                tile_h_scaled = max(1, tile_mask.height // recon_scale)
+                tile_mask_scaled = tile_mask.resize((tile_w_scaled, tile_h_scaled), Image.NEAREST)
+                mask_img.paste(tile_mask_scaled, scaled_origin)
+            except Exception:
+                pass
+
+    # Already downscaled; no need to resize again
+    wsi_scaled = wsi_img
+    mask_scaled = mask_img
 
     output_recon_dir = output_dir / slide_name / 'reconstructions'
     output_recon_dir.mkdir(parents=True, exist_ok=True)
@@ -244,11 +167,7 @@ def process_all_slides_dynamic(
     recon_scale: int,
     mem_monitor: MemoryMonitor,
 ):
-    """
-    Process all slides with dynamic worker adaptation.
-
-    Workers adjust based on available memory — never exceed mem_percent.
-    """
+    """Process all slides with dynamic worker adaptation."""
     slides = sorted([d.name for d in input_dir.iterdir() if d.is_dir()])
     if not slides:
         print(f"No slides found in {input_dir}")
@@ -261,19 +180,16 @@ def process_all_slides_dynamic(
     failed = 0
     pbar = tqdm(total=len(slides), desc="Reconstructing", unit="slide")
 
-    # Use a future-based approach to dynamically manage workers
     max_workers = min(8, mem_monitor.get_recommended_workers() * 2)
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
 
-        # Submit initial batch
         for slide in slides[:3]:
             future = executor.submit(reconstruct_slide, slide, input_dir, output_dir, recon_scale)
             futures[future] = slide
 
         slide_idx = 3
 
-        # Process futures as they complete
         while futures:
             done, _ = wait(futures, timeout=0.5, return_when='FIRST_COMPLETED')
 
@@ -291,9 +207,7 @@ def process_all_slides_dynamic(
 
                 pbar.update(1)
 
-                # Try to submit next slide if memory allows
                 while slide_idx < len(slides):
-                    # Estimate memory for next slide
                     avg_mem = sum(mem_monitor.slide_memory_cache.values()) / len(mem_monitor.slide_memory_cache) if mem_monitor.slide_memory_cache else 500 * 1024**2
                     if mem_monitor.can_load_slide(int(avg_mem)):
                         next_slide = slides[slide_idx]
@@ -400,10 +314,8 @@ Examples:
 
     if args.all or not args.slide_name:
         if args.workers is not None:
-            # Fixed workers mode
             process_all_slides_fixed(args.input_dir, output_dir, args.scale, args.workers)
         else:
-            # Dynamic workers mode
             if not HAS_PSUTIL:
                 print("⚠️  psutil not installed. Installing it would enable dynamic memory monitoring.")
                 print("   Falling back to fixed 2 workers.")
