@@ -108,30 +108,27 @@ def generate_otsu_mask(img_or_slide: object, downsample_factor: int = 20) -> Tup
     if hasattr(img_or_slide, 'get_thumbnail'):  # OpenSlide — memory-efficient
         w, h = img_or_slide.level_dimensions[0]
         thumb = img_or_slide.get_thumbnail((w // downsample_factor, h // downsample_factor))
-    else:  # PIL Image — three-stage aggressive downsampling to avoid full load
+    else:  # PIL Image — crop small region instead of resize (memory-safe)
         w, h = img_or_slide.size
-        target_w = w // downsample_factor
-        target_h = h // downsample_factor
-
         try:
-            if hasattr(img_or_slide, 'draft'):
-                img_or_slide.draft('RGB', (target_w, target_h))
             if w > 20000 or h > 20000:
-                stage1 = w // 50
-                stage2 = w // 5
-                intermediate1 = img_or_slide.resize((stage1, h // 50), Image.Resampling.NEAREST)
-                intermediate2 = intermediate1.resize((stage2, h // 5), Image.Resampling.BILINEAR)
-                thumb = intermediate2.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                crop_w = min(8000, w)
+                crop_h = min(8000, h)
+                thumb = img_or_slide.crop((0, 0, crop_w, crop_h))
+                thumb.thumbnail((max(64, crop_w // 100), max(64, crop_h // 100)), Image.Resampling.LANCZOS)
             elif w > 10000 or h > 10000:
-                scale = max(1, downsample_factor // 2)
-                intermediate = img_or_slide.resize((w // scale, h // scale), Image.Resampling.NEAREST)
-                thumb = intermediate.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                crop_w = min(5000, w)
+                crop_h = min(5000, h)
+                thumb = img_or_slide.crop((0, 0, crop_w, crop_h))
+                thumb.thumbnail((max(64, crop_w // 50), max(64, crop_h // 50)), Image.Resampling.LANCZOS)
             else:
-                thumb = img_or_slide.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                target_w = max(64, w // downsample_factor)
+                target_h = max(64, h // downsample_factor)
+                thumb = img_or_slide.copy()
+                thumb.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
         except MemoryError:
-            logger.warning(f"MemoryError during Otsu resize, using extreme downsampling")
-            extreme_scale = max(1, downsample_factor * 5)
-            thumb = img_or_slide.resize((w // extreme_scale, h // extreme_scale), Image.Resampling.NEAREST)
+            logger.warning(f"MemoryError during Otsu crop/thumbnail, returning None")
+            return None, None
 
     thumb_cv = cv2.cvtColor(np.array(thumb.convert('RGB')), cv2.COLOR_RGB2HSV)
     saturation = cv2.medianBlur(thumb_cv[:, :, 1], 7)
@@ -195,7 +192,6 @@ def detect_format(file_path: str) -> Optional[str]:
     if ext in {'.tif', '.tiff'}:
         if openslide and size > LARGE_FILE_THRESHOLD:
             return 'openslide'
-        # PIL for smaller TIFFs only
         if size < LARGE_FILE_THRESHOLD:
             return 'pil'
         # Large TIFF without OpenSlide: warn and try PIL anyway (will be slow)
@@ -203,8 +199,6 @@ def detect_format(file_path: str) -> Optional[str]:
             logger.warning(f"Large TIFF file ({size / 1e9:.1f} GB) without OpenSlide. Install 'openslide' for efficiency: pip install openslide-python")
             return 'pil'
         return 'pil'
-
-    # SVS, NDPI, VMS: OpenSlide only
     if openslide and ext in {'.svs', '.ndpi', '.vms'}:
         return 'openslide'
 
@@ -454,8 +448,6 @@ def combine_masks_with_priority(
 ) -> np.ndarray:
     """Combine two class masks using explicit priority-based logic."""
     result = current_mask.copy()
-
-    # Find pixels where new_mask has annotation (non-zero)
     new_pixels = new_mask > 0
     new_priority = CLASS_PRIORITY.get(new_class_id, 0)
 
@@ -463,8 +455,6 @@ def combine_masks_with_priority(
         row, col = np.unravel_index(idx_flat, new_pixels.shape)
         current_class_id = result[row, col]
         current_priority = CLASS_PRIORITY.get(current_class_id, 0)
-
-        # New class wins if it has higher priority
         if new_priority > current_priority:
             result[row, col] = 255
 
@@ -491,8 +481,6 @@ def compute_primary_secondary(
             cov = compute_coverage(polygon, tile_box)
             if cov > 0:
                 coverages.append((tile_idx, cov))
-
-        # Sort by coverage descending
         coverages.sort(key=lambda x: x[1], reverse=True)
 
         if coverages and coverages[0][1] >= coverage_threshold:
@@ -646,8 +634,6 @@ def process_slide_pair(
         for tile_idx, (x, y, x_end, y_end) in enumerate(grid_tiles):
             # New tile naming: native coordinates with 5-digit padding
             tile_name = f"{stem}_tile_x{x:05d}_y{y:05d}_endx{x_end:05d}_endy{y_end:05d}"
-
-            # Extract tile image
             if fmt == 'openslide':
                 tile_img = extract_tile_openslide(slide, x, y, tile_size)
             else:
@@ -659,7 +645,6 @@ def process_slide_pair(
             for glom_id, glom_data in enumerate(glomeruli):
                 cov = compute_coverage(glom_data['coordinates'], (x, y, x_end, y_end))
                 if cov > 0:
-                    # Rasterize polygon onto mask
                     glom_mask = rasterize_polygon(
                         glom_data['coordinates'],
                         (x, y, x_end, y_end),
@@ -726,8 +711,6 @@ def process_slide_pair(
             update_coverage_for_centered_tile(glom_id, glom_data['coordinates'], (x, y, x_end, y_end), assignments)
 
             tile_name = f"{stem}_centered_g{glom_id:04d}"
-
-            # Extract tile image
             if fmt == 'openslide':
                 tile_img = extract_tile_openslide(slide, x, y, tile_size)
             else:
@@ -842,7 +825,7 @@ def dynamic_schedule(
     pairs: List[Dict],
     output_dir: str,
     class_map: Dict[str, int],
-    ram_fraction: float = 0.9,
+    ram_fraction: float = 0.5,
     tile_size: int = TILE_SIZE,
     max_workers: int = None
 ) -> List[Dict]:
@@ -953,7 +936,7 @@ def main():
     parser.add_argument(
         '--ram-fraction',
         type=float,
-        default=0.9,
+        default=0.5,
         help='Fraction of available RAM to use (0-1)'
     )
     parser.add_argument(
