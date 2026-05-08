@@ -100,7 +100,7 @@ def calculate_safe_workers(tiff_paths: List[str], target_ram_percent: float = 0.
         if memory_per_worker > 0:
             # Use ceil for aggressive packing (round up if > 0.5)
             num_workers = math.ceil(target_gb / memory_per_worker)
-            num_workers = max(1, min(num_workers, 4))  # Cap at 4
+            num_workers = max(1, min(num_workers, 8))  # Cap at 8 (28 GB RAM available)
         else:
             num_workers = 2
 

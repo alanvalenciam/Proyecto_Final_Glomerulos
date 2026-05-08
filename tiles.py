@@ -60,7 +60,7 @@ def _safe_worker_count(image_paths):
     memory_per_worker = max_file_size_gb * expansion_factor
 
     if memory_per_worker > 0:
-        num_workers = int((available_gb * 0.7) / memory_per_worker)
+        num_workers = int((available_gb * 0.80) / memory_per_worker)
         num_workers = max(1, min(num_workers, cpu_count()))
     else:
         num_workers = min(4, cpu_count())

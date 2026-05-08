@@ -45,10 +45,10 @@ except ImportError:
 class MemoryMonitor:
     """Monitor memory usage and adapt worker count dynamically."""
 
-    def __init__(self, mem_percent: int = 70):
+    def __init__(self, mem_percent: int = 80):
         """
         Args:
-            mem_percent: Max % of total system RAM to use (default 70)
+            mem_percent: Max % of total system RAM to use (default 80 for 28 GB)
         """
         self.mem_percent = mem_percent
         self.total_memory = psutil.virtual_memory().total if HAS_PSUTIL else 16 * 1024**3
@@ -262,7 +262,8 @@ def process_all_slides_dynamic(
     pbar = tqdm(total=len(slides), desc="Reconstructing", unit="slide")
 
     # Use a future-based approach to dynamically manage workers
-    with ProcessPoolExecutor(max_workers=8) as executor:
+    max_workers = min(8, mem_monitor.get_recommended_workers() * 2)
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
 
         # Submit initial batch
@@ -389,8 +390,8 @@ Examples:
     parser.add_argument(
         '--mem-percent',
         type=int,
-        default=70,
-        help='Max %% of system RAM to use in dynamic mode (default: 70)',
+        default=90,
+        help='Max %% of system RAM to use in dynamic mode (default: 90)',
     )
 
     args = parser.parse_args()

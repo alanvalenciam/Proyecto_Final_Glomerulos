@@ -38,7 +38,7 @@ def _safe_worker_count(tile_size_hint: int = 1024) -> int:
     gb_per_worker = bytes_per_worker / (1024**3)
 
     if gb_per_worker > 0:
-        num_workers = int((available_gb * 0.7) / gb_per_worker)
+        num_workers = int((available_gb * 0.80) / gb_per_worker)
         num_workers = max(1, min(num_workers, cpu_count()))
     else:
         num_workers = min(4, cpu_count())
@@ -355,7 +355,7 @@ def _estimate_tile_memory_gb(tile_path: Path) -> float:
 
 def process_folder(input_dir: str, output_dir: str, template_path: Optional[str] = None, template_tiles: Optional[list[str]] = None, num_workers: Optional[int] = None, tile_size: int = 1024,
                    min_tissue_ratio: float = 0.05, bg_l_threshold: int = 230, min_saturation: int = 10, rebuild_template: bool = False,
-                   ram_fraction: float = 0.75, min_free_gb: float = 1.0) -> None:
+                   ram_fraction: float = 0.80, min_free_gb: float = 2.0) -> None:
     """
     Recursively normalize tiles using dynamic parallelism (memory-aware admission control).
 
@@ -370,7 +370,7 @@ def process_folder(input_dir: str, output_dir: str, template_path: Optional[str]
         bg_l_threshold: L channel threshold for background (default 230)
         min_saturation: Minimum HSV saturation for tissue (default 10)
         rebuild_template: If True, force rebuild template from tiles (ignore cache)
-        ram_fraction: Fraction of available RAM to use for processing (0.75 default)
+        ram_fraction: Fraction of available RAM to use for processing (0.9 default)
         min_free_gb: Minimum free RAM to always keep available (1.0 default)
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
@@ -628,8 +628,8 @@ Uso personalizado:
     parser.add_argument(
         "--ram-fraction",
         type=float,
-        default=0.75,
-        help="Fracción de RAM disponible para usar (0.0-1.0, default: 0.75)"
+        default=0.9,
+        help="Fracción de RAM disponible para usar (0.0-1.0, default: 0.9)"
     )
     parser.add_argument(
         "--min-free-gb",

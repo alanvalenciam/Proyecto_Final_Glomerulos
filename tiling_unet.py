@@ -915,7 +915,7 @@ def dynamic_schedule(
     pairs: List[Dict],
     output_dir: str,
     class_map: Dict[str, int],
-    ram_fraction: float = 0.5,
+    ram_fraction: float = 0.9,
     tile_size: int = TILE_SIZE,
     max_workers: int = None
 ) -> List[Dict]:
@@ -1032,7 +1032,7 @@ def main():
     parser.add_argument(
         '--ram-fraction',
         type=float,
-        default=0.5,
+        default=0.9,
         help='Fraction of available RAM to use (0-1)'
     )
     parser.add_argument(

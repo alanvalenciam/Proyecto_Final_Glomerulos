@@ -251,10 +251,10 @@ def process_single_tile(args: Tuple) -> Tuple[str, bool]:
 
 
 def calculate_optimal_workers(avg_tile_size_mb: float = 3.0) -> int:
-    """Calcula nº de workers basado en RAM disponible (70% máximo)."""
+    """Calcula nº de workers basado en RAM disponible (80% máximo para 28 GB)."""
     mem = psutil.virtual_memory()
     free_mb = mem.available / (1024**2)
-    available_for_workers = free_mb * 0.7
+    available_for_workers = free_mb * 0.80
 
     workers = max(1, int(available_for_workers / (avg_tile_size_mb * 5)))
     workers = min(workers, multiprocessing.cpu_count())
@@ -277,8 +277,8 @@ def process_folder(
     workers: int = None,
     n_samples: int = 200,
     rebuild: bool = False,
-    ram_fraction: float = 0.75,
-    min_free_gb: float = 1.0,
+    ram_fraction: float = 0.80,
+    min_free_gb: float = 2.0,
 ):
     """Procesa tiles con paralelismo dinámico (control de admisión basado en RAM)."""
     input_dir = Path(input_dir)
@@ -435,8 +435,8 @@ def main():
     parser.add_argument(
         "--ram-fraction",
         type=float,
-        default=0.75,
-        help="Fracción de RAM disponible para usar (0.0-1.0, default: 0.75)",
+        default=0.9,
+        help="Fracción de RAM disponible para usar (0.0-1.0, default: 0.9)",
     )
     parser.add_argument(
         "--min-free-gb",
