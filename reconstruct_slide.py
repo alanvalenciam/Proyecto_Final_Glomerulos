@@ -5,7 +5,7 @@ import argparse
 import json
 from pathlib import Path
 from concurrent.futures import ProcessPoolExecutor, as_completed, wait
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Dict, Any
 import os
 
 import numpy as np
@@ -18,6 +18,15 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
+# Legend drawing constants
+LEGEND_BOX_SIZE = 40
+LEGEND_ITEM_SPACING = 12
+LEGEND_WIDTH = 320
+LEGEND_MARGIN = 20
+
+# Memory estimation constants
+DEFAULT_SLIDE_MEMORY_ESTIMATE = 500 * 1024**2  # 500 MB default
+
 
 def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
     """Convert hex color '#RRGGBB' to (R, G, B) tuple."""
@@ -25,14 +34,21 @@ def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
     return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
 
+def calculate_scaled_tile_dimensions(tile_width: int, tile_height: int, zoom_scale: float, recon_scale: int) -> Tuple[int, int]:
+    """Calculate scaled tile dimensions accounting for zoom_scale and recon_scale."""
+    tile_native_width = int(tile_width / zoom_scale)
+    tile_native_height = int(tile_height / zoom_scale)
+    tile_w_scaled = max(1, tile_native_width // recon_scale)
+    tile_h_scaled = max(1, tile_native_height // recon_scale)
+    return tile_w_scaled, tile_h_scaled
+
+
 def draw_legend(
     image: Image.Image,
-    class_map: dict,
-    class_colors: dict,
-    margin: int = 20,
-    box_size: int = 40,
-):
-    """Draw a legend on the image showing class colors and names."""
+    class_map: Dict[str, int],
+    class_colors: Dict[str, str],
+) -> None:
+    """Draw legend showing class colors and names on image."""
     draw = ImageDraw.Draw(image, 'RGBA')
 
     # Sort by class ID to ensure consistent order
@@ -43,17 +59,16 @@ def draw_legend(
         return
 
     # Calculate legend dimensions
-    legend_width = 320
-    legend_height = margin + (len(non_bg_classes) * (box_size + 12)) + margin
+    legend_height = LEGEND_MARGIN + (len(non_bg_classes) * (LEGEND_BOX_SIZE + LEGEND_ITEM_SPACING)) + LEGEND_MARGIN
 
     # Draw semi-transparent black background for legend
     draw.rectangle(
-        [margin - 5, margin - 5, margin + legend_width, margin + legend_height],
+        [LEGEND_MARGIN - 5, LEGEND_MARGIN - 5, LEGEND_MARGIN + LEGEND_WIDTH, LEGEND_MARGIN + legend_height],
         fill=(0, 0, 0, 220)
     )
 
-    y = margin
-    x = margin + 10
+    y = LEGEND_MARGIN
+    x = LEGEND_MARGIN + 10
 
     for class_name, class_id in non_bg_classes:
         hex_color = class_colors.get(class_name, '#ffffff')
@@ -61,14 +76,14 @@ def draw_legend(
 
         # Draw colored rectangle
         draw.rectangle(
-            [x, y, x + box_size, y + box_size],
+            [x, y, x + LEGEND_BOX_SIZE, y + LEGEND_BOX_SIZE],
             fill=(r, g, b, 255),
             outline='white'
         )
 
         # Draw class name text - larger and bold
         text = class_name.replace('_', ' ')
-        text_x = x + box_size + 15
+        text_x = x + LEGEND_BOX_SIZE + 15
         text_y = y + 8
 
         # Draw text with black outline for visibility
@@ -76,7 +91,7 @@ def draw_legend(
             draw.text((text_x + adj_x, text_y + adj_y), text, fill='black')
         draw.text((text_x, text_y), text, fill='white')
 
-        y += box_size + 12
+        y += LEGEND_BOX_SIZE + LEGEND_ITEM_SPACING
 
 
 class MemoryMonitor:
@@ -84,7 +99,13 @@ class MemoryMonitor:
 
     def __init__(self, mem_percent: int = 80):
         self.mem_percent = mem_percent
-        self.total_memory = psutil.virtual_memory().total if HAS_PSUTIL else 16 * 1024**3
+        if HAS_PSUTIL:
+            try:
+                self.total_memory = psutil.virtual_memory().total
+            except (AttributeError, OSError):
+                self.total_memory = 16 * 1024**3
+        else:
+            self.total_memory = 16 * 1024**3
         self.max_allowed = (self.total_memory * mem_percent) // 100
         self.slide_memory_cache = {}
 
@@ -107,22 +128,32 @@ class MemoryMonitor:
         return (current_usage + slide_size_estimate) <= self.max_allowed
 
     def get_recommended_workers(self) -> int:
-        """Estimate how many workers can run in parallel without exceeding mem_percent."""
+        """Estimate workers without exceeding mem_percent."""
         if not HAS_PSUTIL:
             return 2
 
+        avg_mem = (
+            sum(self.slide_memory_cache.values()) /
+            len(self.slide_memory_cache)
+            if self.slide_memory_cache
+            else DEFAULT_SLIDE_MEMORY_ESTIMATE
+        )
+        max_workers = max(1, (self.max_allowed // int(avg_mem)))
         available = self.get_available_memory()
-        avg_slide_memory = sum(self.slide_memory_cache.values()) / len(self.slide_memory_cache) if self.slide_memory_cache else 500 * 1024**2
-        max_workers = max(1, (self.max_allowed // int(avg_slide_memory)))
-        return int(min(max(1, available // int(avg_slide_memory * 1.2)), max_workers))
+        return int(
+            min(
+                max(1, available // int(avg_mem * 1.2)),
+                max_workers
+            )
+        )
 
     def report_slide_memory(self, slide_name: str, memory_used: int):
         """Cache memory usage of a slide for future estimates."""
         self.slide_memory_cache[slide_name] = memory_used
 
 
-def load_annotations(annotations_path: Path) -> dict:
-    """Load annotations.json and return parsed dict."""
+def load_annotations(annotations_path: Path) -> Dict[str, Any]:
+    """Load and parse annotations.json file."""
     with open(annotations_path, 'r') as f:
         return json.load(f)
 
@@ -138,7 +169,12 @@ def reconstruct_slide(
     if output_dir is None:
         output_dir = input_dir
 
-    mem_start = psutil.Process(os.getpid()).memory_info().rss if HAS_PSUTIL else 0
+    mem_start = 0
+    if HAS_PSUTIL:
+        try:
+            mem_start = psutil.Process(os.getpid()).memory_info().rss
+        except (AttributeError, OSError):
+            mem_start = 0
 
     slide_dir = input_dir / slide_name
     annotations_path = slide_dir / 'annotations.json'
@@ -148,7 +184,7 @@ def reconstruct_slide(
 
     try:
         annotations = load_annotations(annotations_path)
-    except Exception as e:
+    except (json.JSONDecodeError, IOError) as e:
         return False, f"Failed to load annotations: {e}", 0
 
     native_width = annotations.get('width_native', 0)
@@ -180,76 +216,99 @@ def reconstruct_slide(
         if image_path.exists():
             try:
                 tile_img = Image.open(image_path).convert('RGB')
-                # Tiles are at zoom_scale, convert to native pixels then apply recon_scale
-                tile_native_width = int(tile_img.width / zoom_scale)
-                tile_native_height = int(tile_img.height / zoom_scale)
-                tile_w_scaled = max(1, tile_native_width // recon_scale)
-                tile_h_scaled = max(1, tile_native_height // recon_scale)
-                tile_img_scaled = tile_img.resize((tile_w_scaled, tile_h_scaled), Image.LANCZOS)
+                w_s, h_s = calculate_scaled_tile_dimensions(
+                    tile_img.width, tile_img.height, zoom_scale, recon_scale
+                )
+                tile_img_scaled = tile_img.resize(
+                    (w_s, h_s), Image.LANCZOS
+                )
                 wsi_img.paste(tile_img_scaled, scaled_origin)
-            except Exception as e:
-                print(f"  ⚠️  Warning: Failed to load tile image {image_path}: {e}")
+            except (IOError, OSError) as e:
+                msg = f"  ⚠️  Warning: Failed to load image {image_path}: {e}"
+                print(msg)
 
         if mask_path.exists():
             try:
                 tile_mask = Image.open(mask_path).convert('RGB')
-                # Tiles are at zoom_scale, convert to native pixels then apply recon_scale
-                tile_native_width = int(tile_mask.width / zoom_scale)
-                tile_native_height = int(tile_mask.height / zoom_scale)
-                tile_w_scaled = max(1, tile_native_width // recon_scale)
-                tile_h_scaled = max(1, tile_native_height // recon_scale)
-                tile_mask_scaled = tile_mask.resize((tile_w_scaled, tile_h_scaled), Image.NEAREST)
+                w_s, h_s = calculate_scaled_tile_dimensions(
+                    tile_mask.width, tile_mask.height, zoom_scale, recon_scale
+                )
+                tile_mask_scaled = tile_mask.resize(
+                    (w_s, h_s), Image.NEAREST
+                )
 
-                # Convert to RGBA and make black pixels (background) transparent
+                # Make black background pixels transparent
                 tile_mask_rgba = tile_mask_scaled.convert('RGBA')
                 mask_arr = np.array(tile_mask_rgba)
-                is_black = (mask_arr[:, :, 0] == 0) & (mask_arr[:, :, 1] == 0) & (mask_arr[:, :, 2] == 0)
+                is_black = (
+                    (mask_arr[:, :, 0] == 0) &
+                    (mask_arr[:, :, 1] == 0) &
+                    (mask_arr[:, :, 2] == 0)
+                )
                 alpha_arr = np.where(is_black, 0, overlay_alpha)
-                tile_mask_rgba.putalpha(Image.fromarray(alpha_arr.astype(np.uint8)))
+                tile_mask_rgba.putalpha(
+                    Image.fromarray(alpha_arr.astype(np.uint8))
+                )
 
-                # Create a temporary canvas for this tile at the correct position
-                tile_canvas = Image.new('RGBA', (canvas_width, canvas_height), (0, 0, 0, 0))
-                tile_canvas.paste(tile_mask_rgba, scaled_origin, tile_mask_rgba)
+                # Composite tile onto main mask canvas
+                tile_canvas = Image.new(
+                    'RGBA', (canvas_width, canvas_height), (0, 0, 0, 0)
+                )
+                tile_canvas.paste(
+                    tile_mask_rgba, scaled_origin, tile_mask_rgba
+                )
+                mask_canvas = Image.alpha_composite(
+                    mask_canvas, tile_canvas
+                )
 
-                # Composite tile canvas onto main mask canvas
-                mask_canvas = Image.alpha_composite(mask_canvas, tile_canvas)
-
-            except Exception as e:
-                print(f"  ⚠️  Warning: Failed to load mask {mask_path}: {e}")
-
-    wsi_scaled = wsi_img
+            except (IOError, OSError) as e:
+                msg = f"  ⚠️  Warning: Failed to load mask {mask_path}: {e}"
+                print(msg)
 
     output_recon_dir = output_dir / slide_name / 'reconstructions'
     output_recon_dir.mkdir(parents=True, exist_ok=True)
 
     try:
-        recon_path = output_recon_dir / f"{slide_name}_reconstruction.png"
-        mask_colored_path = output_recon_dir / f"{slide_name}_mask_colored.png"
+        recon_path = (
+            output_recon_dir / f"{slide_name}_reconstruction.png"
+        )
+        mask_colored_path = (
+            output_recon_dir / f"{slide_name}_mask_colored.png"
+        )
         overlay_path = output_recon_dir / f"{slide_name}_overlay.png"
 
-        wsi_scaled.save(recon_path, 'PNG')
+        wsi_img.save(recon_path, 'PNG')
 
-        # Save colored mask (RGBA flattened to RGB with black background)
+        # Save colored mask
         mask_rgb_out = mask_canvas.convert('RGB')
         mask_rgb_out.save(mask_colored_path, 'PNG')
 
         # Create colored overlay
-        wsi_rgba = wsi_scaled.convert('RGBA')
+        wsi_rgba = wsi_img.convert('RGBA')
         overlay_canvas = Image.alpha_composite(wsi_rgba, mask_canvas)
         overlay_rgb = overlay_canvas.convert('RGB')
 
-        # Draw legend if we have class info
+        # Draw legend if class info available
         if class_map and class_colors:
             draw_legend(overlay_rgb, class_map, class_colors)
 
         overlay_rgb.save(overlay_path, 'PNG')
 
-        mem_end = psutil.Process(os.getpid()).memory_info().rss if HAS_PSUTIL else 0
+        mem_end = 0
+        if HAS_PSUTIL:
+            try:
+                mem_end = psutil.Process(os.getpid()).memory_info().rss
+            except (AttributeError, OSError):
+                mem_end = mem_start
         mem_used = mem_end - mem_start
 
-        return True, f"{slide_name}: 3 outputs saved (reconstruction + colored_mask + overlay)", mem_used
+        msg = (
+            f"{slide_name}: 3 outputs saved "
+            "(reconstruction + colored_mask + overlay)"
+        )
+        return True, msg, mem_used
 
-    except Exception as e:
+    except (IOError, OSError) as e:
         return False, f"Failed to save outputs: {e}", 0
 
 
@@ -300,15 +359,29 @@ def process_all_slides_dynamic(
 
                 pbar.update(1)
 
-                while slide_idx < len(slides):
-                    avg_mem = sum(mem_monitor.slide_memory_cache.values()) / len(mem_monitor.slide_memory_cache) if mem_monitor.slide_memory_cache else 500 * 1024**2
-                    if mem_monitor.can_load_slide(int(avg_mem)):
-                        next_slide = slides[slide_idx]
-                        future = executor.submit(reconstruct_slide, next_slide, input_dir, output_dir, recon_scale, overlay_alpha)
-                        futures[future] = next_slide
-                        slide_idx += 1
-                    else:
-                        break
+            # Calculate average memory once per completed batch
+            avg_mem = (
+                sum(mem_monitor.slide_memory_cache.values()) /
+                len(mem_monitor.slide_memory_cache)
+                if mem_monitor.slide_memory_cache
+                else DEFAULT_SLIDE_MEMORY_ESTIMATE
+            )
+
+            while slide_idx < len(slides):
+                if mem_monitor.can_load_slide(int(avg_mem)):
+                    next_slide = slides[slide_idx]
+                    future = executor.submit(
+                        reconstruct_slide,
+                        next_slide,
+                        input_dir,
+                        output_dir,
+                        recon_scale,
+                        overlay_alpha
+                    )
+                    futures[future] = next_slide
+                    slide_idx += 1
+                else:
+                    break
 
     pbar.close()
     print(f"\n✅ Complete: {completed} OK, {failed} failed")
