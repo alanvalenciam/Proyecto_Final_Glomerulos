@@ -1,0 +1,18 @@
+tile_size: 1024
+zoom_scale: 0.5
+stride: 512
+min_coverage_pct: 60.0
+output_format: png
+compression: 0
+
+tissue_filter:
+  otsu_min_ratio: 0.01
+  bg_threshold: 15.0
+  downsample_factor: 20
+
+class_map:
+  background: 0
+  No_Proliferativo: 1
+  Proliferativo: 2
+  Esclerosado: 3
+  Excluido: 4

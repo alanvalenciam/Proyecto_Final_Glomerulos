@@ -2,6 +2,7 @@
 
 import os
 import json
+import yaml
 import logging
 import argparse
 import numpy as np
@@ -19,10 +20,14 @@ except ImportError:
     openslide = None
 
 try:
-    import cv2
-    OPENCV_AVAILABLE = True
+    import tifffile
 except ImportError:
-    OPENCV_AVAILABLE = False
+    tifffile = None
+
+try:
+    import cv2
+except ImportError:
+    raise ImportError("opencv-python is required: pip install opencv-python")
 
 try:
     from skimage import draw
@@ -52,16 +57,6 @@ OUTPUT_FORMAT = 'png'
 COMPRESSION = 0
 
 LARGE_FILE_THRESHOLD = 300 * 1024 * 1024  # 300 MB
-
-# Explicit class priority for mask overlaps (higher = higher priority)
-# When polygons overlap, the class with the highest priority wins
-CLASS_PRIORITY = {
-    0: 0,      # background (lowest priority)
-    1: 10,     # No_Proliferativo
-    2: 8,      # Proliferativo
-    3: 5,      # Esclerosado
-    4: 1,      # Excluido (lowest priority despite highest class_id)
-}
 
 # Class mapping — CANONICAL and FIXED (deterministic)
 CANONICAL_CLASS_MAP = {
@@ -101,14 +96,13 @@ DOWNSAMPLE_FACTOR = 20    # for Otsu mask generation
 
 def generate_otsu_mask(img_or_slide: object, downsample_factor: int = 20) -> Tuple[Optional[np.ndarray], Optional[int]]:
     """Generate binary tissue mask via Otsu thresholding on HSV saturation."""
-    if not OPENCV_AVAILABLE:
-        logger.warning("OpenCV not available, skipping Otsu mask")
-        return None, None
-
     if hasattr(img_or_slide, 'get_thumbnail'):  # OpenSlide — memory-efficient
         w, h = img_or_slide.level_dimensions[0]
         thumb = img_or_slide.get_thumbnail((w // downsample_factor, h // downsample_factor))
-    else:  # PIL Image — crop small region instead of resize (memory-safe)
+    else:  # PIL Image or numpy.ndarray
+        if isinstance(img_or_slide, np.ndarray):
+            logger.warning("Otsu mask is not supported for numpy array inputs")
+            return None, None
         w, h = img_or_slide.size
         try:
             if w > 20000 or h > 20000:
@@ -184,7 +178,7 @@ def get_available_ram_gb() -> float:
     return psutil.virtual_memory().available / (1024**3)
 
 def detect_format(file_path: str) -> Optional[str]:
-    """Detect image format: 'openslide', 'pil', or None."""
+    """Detect image format: 'openslide', 'pil', 'tifffile', or None."""
     ext = Path(file_path).suffix.lower()
     size = os.path.getsize(file_path)
 
@@ -194,10 +188,14 @@ def detect_format(file_path: str) -> Optional[str]:
             return 'openslide'
         if size < LARGE_FILE_THRESHOLD:
             return 'pil'
-        # Large TIFF without OpenSlide: warn and try PIL anyway (will be slow)
+        # Large TIFF without OpenSlide: use tifffile for memory-mapped access
         if not openslide and size > LARGE_FILE_THRESHOLD:
-            logger.warning(f"Large TIFF file ({size / 1e9:.1f} GB) without OpenSlide. Install 'openslide' for efficiency: pip install openslide-python")
-            return 'pil'
+            if tifffile:
+                logger.info(f"Large TIFF file ({size / 1e9:.1f} GB) without OpenSlide. Using tifffile for memory-mapped access.")
+                return 'tifffile'
+            else:
+                logger.warning(f"Large TIFF file ({size / 1e9:.1f} GB) without OpenSlide or tifffile. Install 'tifffile': pip install tifffile")
+                return 'pil'
         return 'pil'
     if openslide and ext in {'.svs', '.ndpi', '.vms'}:
         return 'openslide'
@@ -218,6 +216,24 @@ def load_slide(tiff_path: str) -> Tuple[object, int, int, str]:
             return slide, w, h, 'openslide'
         except Exception as e:
             logger.warning(f"OpenSlide failed on {tiff_path}: {e}. Falling back to PIL.")
+
+    # tifffile branch (memory-mapped for large TIFFs)
+    if fmt == 'tifffile':
+        try:
+            slide = tifffile.memmap(tiff_path)
+            h, w = slide.shape[:2]  # memmap returns (height, width, ...)
+            logger.info(f"Loaded {tiff_path} with tifffile.memmap: {w}x{h}")
+            return slide, w, h, 'tifffile'
+        except Exception as e:
+            logger.error(f"tifffile.memmap failed for {tiff_path}: {e}. Falling back to PIL.")
+            # Fallback to PIL as last resort
+            try:
+                img = Image.open(tiff_path)
+                w, h = img.size
+                return img, w, h, 'pil'
+            except Exception as e2:
+                logger.error(f"PIL also failed on {tiff_path}: {e2}")
+                raise
 
     # PIL fallback
     try:
@@ -245,6 +261,48 @@ def extract_tile_openslide(slide: object, x: int, y: int, size: int, level: int 
     """Extract a tile from an OpenSlide slide."""
     tile = slide.read_region((x, y), level, (size, size))
     tile = tile.convert('RGB')
+    return tile
+
+def extract_tile_tifffile(slide: np.ndarray, x: int, y: int, size: int) -> Image.Image:
+    """Extract a tile from a tifffile memmap."""
+    h, w = slide.shape[:2]
+
+    # Clamp to bounds
+    x_start = max(0, min(x, w - 1))
+    y_start = max(0, min(y, h - 1))
+    x_end = min(x + size, w)
+    y_end = min(y + size, h)
+
+    # Extract region (memmap slice returns numpy array)
+    region = slide[y_start:y_end, x_start:x_end]
+
+    # Convert to PIL Image
+    if len(region.shape) == 2:  # Grayscale
+        tile = Image.fromarray(region, mode='L')
+        # Convert to RGB for consistency
+        tile = tile.convert('RGB')
+    elif len(region.shape) == 3 and region.shape[2] == 3:  # RGB
+        tile = Image.fromarray(region, mode='RGB')
+    elif len(region.shape) == 3 and region.shape[2] == 4:  # RGBA
+        tile = Image.fromarray(region, mode='RGBA')
+        tile = tile.convert('RGB')
+    else:
+        # Fallback: treat as grayscale
+        logger.warning(f"Unexpected shape in tifffile region: {region.shape}, treating as grayscale")
+        if region.size > 0:
+            tile = Image.fromarray(np.uint8(region), mode='L')
+            tile = tile.convert('RGB')
+        else:
+            # Return white tile if region is empty
+            tile = Image.new('RGB', (size, size), (255, 255, 255))
+            return tile
+
+    # Pad if needed (tile smaller than requested size)
+    if tile.size != (size, size):
+        padded = Image.new('RGB', (size, size), (255, 255, 255))
+        padded.paste(tile, (0, 0))
+        tile = padded
+
     return tile
 
 def load_geojson(geojson_path: str) -> Dict:
@@ -323,105 +381,58 @@ def compute_polygon_centroid(polygon_coords: List[List[float]]) -> Tuple[float, 
     centroid = poly.centroid
     return centroid.x, centroid.y
 
+def iter_polygons(geom):
+    """Iterate over Polygon objects from any Shapely geometry (handles MultiPolygon, GeometryCollection, etc.)."""
+    if geom.is_empty:
+        return
+    from shapely.geometry import MultiPolygon, GeometryCollection
+    if isinstance(geom, Polygon):
+        yield geom
+    elif isinstance(geom, (MultiPolygon, GeometryCollection)):
+        for g in geom.geoms:
+            if isinstance(g, Polygon):
+                yield g
+            elif isinstance(g, MultiPolygon):
+                for p in g.geoms:
+                    yield p
+
 def rasterize_polygon(
     polygon_coords: List[List[float]],
     tile_box: Tuple[int, int, int, int],
-    tile_size: int = TILE_SIZE
+    tile_size: int = TILE_SIZE,
+    zoom_scale: float = 1.0
 ) -> np.ndarray:
-    """Rasterize a polygon to a numpy array within a tile's bounding box."""
+    """Rasterize a polygon to a numpy array within a tile's bounding box using cv2.fillPoly."""
     mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
+    x0, y0 = tile_box[0], tile_box[1]
 
-    try:
-        polygon = polygon_to_shapely(polygon_coords)
-        if not polygon.is_valid:
-            polygon = polygon.buffer(0)
+    # Clip polygon to tile bounds with Shapely
+    tile_poly = box(tile_box[0], tile_box[1], tile_box[2], tile_box[3])
+    glom_poly = Polygon(polygon_coords)
+    if not glom_poly.is_valid:
+        glom_poly = glom_poly.buffer(0)
+    if glom_poly.is_empty or glom_poly.area == 0:
+        return mask
 
-        tile_poly = box(tile_box[0], tile_box[1], tile_box[2], tile_box[3])
-        intersection = polygon.intersection(tile_poly)
+    clipped = glom_poly.intersection(tile_poly)
+    if clipped.is_empty:
+        return mask
 
-        if intersection.is_empty or intersection.area == 0:
-            return mask
+    # Iterate over all polygons in the clipped result (handles MultiPolygon, GeometryCollection, etc.)
+    for poly in iter_polygons(clipped):
+        coords = list(poly.exterior.coords)
 
-        from shapely.geometry import GeometryCollection, MultiPolygon, LineString
-        if isinstance(intersection, GeometryCollection):
-            geoms = list(intersection.geoms)
-        elif isinstance(intersection, MultiPolygon):
-            geoms = list(intersection.geoms)
-        else:
-            geoms = [intersection]
+        # Convert native coords to output pixel coords
+        pts = np.array([
+            [int((c[0] - x0) * zoom_scale), int((c[1] - y0) * zoom_scale)]
+            for c in coords
+        ], dtype=np.int32)
 
-        for geom in geoms:
-            if geom.is_empty or isinstance(geom, LineString):
-                continue
-            if hasattr(geom, 'exterior'):
-                coords = list(geom.exterior.coords)
-                tile_coords = [
-                    (c[0] - tile_box[0], c[1] - tile_box[1])
-                    for c in coords
-                ]
-                if len(tile_coords) > 2:
-                    rr, cc = _bresenham_polygon(tile_coords, tile_size)
-                    if len(rr) > 0:
-                        mask[rr, cc] = 255
-    except Exception as e:
-        logger.warning(f"Failed to rasterize polygon: {e}")
+        if len(pts) >= 3:
+            cv2.fillPoly(mask, [pts], color=255)
 
     return mask
 
-def _bresenham_polygon(coords: List[Tuple[int, int]], size: int) -> Tuple[np.ndarray, np.ndarray]:
-    """Rasterize polygon interior using scan-line fill algorithm."""
-    if SKIMAGE_AVAILABLE:
-        try:
-            rr, cc = draw.polygon([c[1] for c in coords], [c[0] for c in coords], shape=(size, size))
-            return rr, cc
-        except Exception as e:
-            logger.debug(f"skimage.draw.polygon failed: {e}")
-            pass
-
-    if len(coords) < 3:
-        logger.debug(f"Polygon has {len(coords)} coords, need >= 3")
-        return np.array([], dtype=int), np.array([], dtype=int)
-
-    rows = [int(round(c[1])) for c in coords]
-    cols = [int(round(c[0])) for c in coords]
-
-    min_row, max_row = min(rows), max(rows)
-    min_col, max_col = min(cols), max(cols)
-
-    min_row = max(0, min_row)
-    max_row = min(size - 1, max_row)
-    min_col = max(0, min_col)
-    max_col = min(size - 1, max_col)
-
-    filled_rr, filled_cc = [], []
-
-    for row in range(min_row, max_row + 1):
-        intersections = []
-        for i in range(len(coords)):
-            y1 = rows[i]
-            y2 = rows[(i + 1) % len(coords)]
-            x1 = cols[i]
-            x2 = cols[(i + 1) % len(coords)]
-
-            if (y1 <= row <= y2) or (y2 <= row <= y1):
-                if y1 != y2:
-                    x_intersect = x1 + (row - y1) * (x2 - x1) / (y2 - y1)
-                    intersections.append(x_intersect)
-                elif y1 == row:
-                    intersections.append(x1)
-                    intersections.append(x2)
-
-        if len(intersections) >= 2:
-            intersections.sort()
-            for j in range(0, len(intersections), 2):
-                if j + 1 < len(intersections):
-                    col_start = max(0, int(intersections[j]))
-                    col_end = min(size - 1, int(intersections[j + 1]))
-                    for col in range(col_start, col_end + 1):
-                        filled_rr.append(row)
-                        filled_cc.append(col)
-
-    return np.array(filled_rr, dtype=int), np.array(filled_cc, dtype=int)
 
 def compute_coverage(
     polygon_coords: List[List[float]],
@@ -430,7 +441,9 @@ def compute_coverage(
     """Compute percentage of polygon area that overlaps with tile_box."""
     try:
         polygon = polygon_to_shapely(polygon_coords)
-        if polygon.area == 0:
+        if not polygon.is_valid:
+            polygon = polygon.buffer(0)
+        if polygon.is_empty or polygon.area == 0:
             return 0.0
 
         tile_poly = box(tile_box[0], tile_box[1], tile_box[2], tile_box[3])
@@ -440,25 +453,6 @@ def compute_coverage(
     except Exception as e:
         logger.warning(f"Failed to compute coverage: {e}")
         return 0.0
-
-def combine_masks_with_priority(
-    current_mask: np.ndarray,
-    new_mask: np.ndarray,
-    new_class_id: int
-) -> np.ndarray:
-    """Combine two class masks using explicit priority-based logic."""
-    result = current_mask.copy()
-    new_pixels = new_mask > 0
-    new_priority = CLASS_PRIORITY.get(new_class_id, 0)
-
-    for idx_flat in np.where(new_pixels.ravel())[0]:
-        row, col = np.unravel_index(idx_flat, new_pixels.shape)
-        current_class_id = result[row, col]
-        current_priority = CLASS_PRIORITY.get(current_class_id, 0)
-        if new_priority > current_priority:
-            result[row, col] = 255
-
-    return result
 
 # ============================================================================
 # Primary/Secondary tile assignment
@@ -551,7 +545,13 @@ def process_slide_pair(
     class_map: Dict[str, int],
     tile_size: int = TILE_SIZE,
     zoom_scale: float = ZOOM_SCALE,
-    stride: int = STRIDE
+    stride: int = STRIDE,
+    min_coverage_pct: float = MIN_COVERAGE_PCT,
+    output_format: str = OUTPUT_FORMAT,
+    compression: int = COMPRESSION,
+    otsu_min_ratio: float = OTSU_MIN_RATIO,
+    bg_threshold: float = BG_THRESHOLD,
+    downsample_factor: int = DOWNSAMPLE_FACTOR
 ) -> Dict:
     """Process a single TIFF+GeoJSON pair and generate tiles, masks, and metadata."""
     stem = pair['stem']
@@ -563,16 +563,27 @@ def process_slide_pair(
         slide, width, height, fmt = load_slide(image_path)
         geojson_data = load_geojson(geojson_path)
 
-        # Generate Otsu tissue mask for filtering
-        logger.info(f"[{stem}] Computing Otsu tissue mask...")
-        otsu_mask, ds_factor = generate_otsu_mask(slide, downsample_factor=DOWNSAMPLE_FACTOR)
+        # Generate Otsu tissue mask for filtering (OpenSlide only; tifffile uses per-tile background filter)
+        if fmt == "openslide":
+            logger.info(f"[{stem}] Computing Otsu tissue mask...")
+            otsu_mask, ds_factor = generate_otsu_mask(slide, downsample_factor=downsample_factor)
+        else:
+            logger.info(f"[{stem}] Skipping Otsu mask for fmt={fmt}; using per-tile background filter only")
+            otsu_mask, ds_factor = None, None
         native_tile_size = int(tile_size / zoom_scale)
+        native_stride = int(stride / zoom_scale)
 
         # Extract glomeruli from GeoJSON with class normalization
         glomeruli = []
         for feat_idx, feature in enumerate(geojson_data.get('features', [])):
             geom = feature.get('geometry', {})
-            if geom.get('type') != 'Polygon':
+            geom_type = geom.get('type')
+            if geom_type == 'Polygon':
+                polygon_coord_list = [geom['coordinates'][0]]
+            elif geom_type == 'MultiPolygon':
+                polygon_coord_list = [poly[0] for poly in geom['coordinates']]
+            else:
+                logger.debug(f"[{stem}] Feature {feat_idx} has unsupported geometry type {geom_type!r}, skipping")
                 continue
 
             props = feature.get('properties', {})
@@ -587,30 +598,31 @@ def process_slide_pair(
             normalized_class_name = normalize_class_name(raw_class_name)
             class_id = class_map.get(normalized_class_name, class_map.get('background', 0))
 
-            coords = geom.get('coordinates', [[]])[0]
-            if len(coords) < 3:
-                logger.warning(f"[{stem}] Feature {feat_idx} has < 3 coordinates, skipping")
-                continue
+            # Add each polygon as a separate glomerulus entry (with the same class)
+            for coords in polygon_coord_list:
+                if len(coords) < 3:
+                    logger.warning(f"[{stem}] Feature {feat_idx} polygon has < 3 coordinates, skipping")
+                    continue
 
-            glomeruli.append({
-                'id': len(glomeruli),
-                'feature_index': feat_idx,
-                'raw_class_name': raw_class_name,
-                'class_name': normalized_class_name,
-                'class_id': class_id,
-                'coordinates': coords
-            })
+                glomeruli.append({
+                    'id': len(glomeruli),
+                    'feature_index': feat_idx,
+                    'raw_class_name': raw_class_name,
+                    'class_name': normalized_class_name,
+                    'class_id': class_id,
+                    'coordinates': coords
+                })
 
         logger.info(f"[{stem}] Found {len(glomeruli)} glomeruli")
 
         # Generate grid tiles
         logger.info(f"[{stem}] Generating grid tiles (size={tile_size}, stride={stride})...")
-        grid_tiles = generate_grid_tiles(width, height, tile_size, stride)
+        grid_tiles = generate_grid_tiles(width, height, native_tile_size, native_stride)
         logger.info(f"[{stem}] Generated {len(grid_tiles)} grid tiles")
 
         # Compute primary/secondary assignments
         logger.info(f"[{stem}] Computing primary/secondary tile assignments...")
-        assignments = compute_primary_secondary(glomeruli, grid_tiles)
+        assignments = compute_primary_secondary(glomeruli, grid_tiles, coverage_threshold=min_coverage_pct)
 
         # Determine which centered tiles are needed
         centered_glom_ids = [gid for gid, asg in assignments.items() if asg['needs_centered_tile']]
@@ -619,9 +631,13 @@ def process_slide_pair(
         # Create output directory
         slide_output_dir = Path(output_dir) / stem
         images_dir = slide_output_dir / 'images'
-        masks_dir = slide_output_dir / 'masks'
+        masks_dir = slide_output_dir / 'masks_binary'
+        class_masks_dir = slide_output_dir / 'masks_class'
+        instance_masks_dir = slide_output_dir / 'masks_instance'
         images_dir.mkdir(parents=True, exist_ok=True)
         masks_dir.mkdir(parents=True, exist_ok=True)
+        class_masks_dir.mkdir(parents=True, exist_ok=True)
+        instance_masks_dir.mkdir(parents=True, exist_ok=True)
 
         # Build tile registry for metadata
         tile_registry = []
@@ -635,23 +651,39 @@ def process_slide_pair(
             # New tile naming: native coordinates with 5-digit padding
             tile_name = f"{stem}_tile_x{x:05d}_y{y:05d}_endx{x_end:05d}_endy{y_end:05d}"
             if fmt == 'openslide':
-                tile_img = extract_tile_openslide(slide, x, y, tile_size)
+                tile_img = extract_tile_openslide(slide, x, y, native_tile_size)
+            elif fmt == 'tifffile':
+                tile_img = extract_tile_tifffile(slide, x, y, native_tile_size)
             else:
-                tile_img = extract_tile_pil(slide, x, y, tile_size)
+                tile_img = extract_tile_pil(slide, x, y, native_tile_size)
 
-            mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
+            # Resize to output tile_size if needed
+            if tile_img.size != (tile_size, tile_size):
+                tile_img = tile_img.resize((tile_size, tile_size), Image.Resampling.LANCZOS)
+
+            binary_mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
+            class_mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
+            instance_mask = np.zeros((tile_size, tile_size), dtype=np.uint16)
             tile_glomeruli = []
 
-            for glom_id, glom_data in enumerate(glomeruli):
+            for idx, glom_data in enumerate(glomeruli, start=1):
                 cov = compute_coverage(glom_data['coordinates'], (x, y, x_end, y_end))
                 if cov > 0:
                     glom_mask = rasterize_polygon(
                         glom_data['coordinates'],
                         (x, y, x_end, y_end),
-                        tile_size
+                        tile_size,
+                        zoom_scale
                     )
-                    # Combine masks using explicit priority (not implicit np.maximum)
-                    mask = combine_masks_with_priority(mask, glom_mask, glom_data['class_id'])
+                    # Vectorized binary union
+                    np.maximum(binary_mask, glom_mask, out=binary_mask)
+                    # Set class_id where annotation exists
+                    class_id = glom_data['class_id']
+                    class_mask[glom_mask > 0] = class_id
+                    # Assign instance_id (first annotation wins per pixel)
+                    instance_mask[(glom_mask > 0) & (instance_mask == 0)] = idx
+
+                    glom_id = glom_data['id']
 
                     role = 'primary' if assignments[glom_id]['primary_tile_idx'] == tile_idx else 'secondary'
                     tile_glomeruli.append({
@@ -667,26 +699,40 @@ def process_slide_pair(
 
             if not has_annotations:
                 # Apply tissue filters only to tiles without annotations
-                if not has_tissue_in_mask(otsu_mask, x, y, native_tile_size, ds_factor, OTSU_MIN_RATIO):
+                if not has_tissue_in_mask(otsu_mask, x, y, native_tile_size, ds_factor, otsu_min_ratio):
                     tiles_skipped += 1
                     continue
-                if is_mostly_background(tile_img, BG_THRESHOLD):
+                if is_mostly_background(tile_img, bg_threshold):
                     tiles_skipped += 1
                     continue
 
-            # Save tile and mask
-            img_path = images_dir / f"{tile_name}.{OUTPUT_FORMAT}"
-            mask_path = masks_dir / f"{tile_name}_mask.{OUTPUT_FORMAT}"
-            save_tile_image(tile_img, str(img_path))
-            save_tile_mask(mask, str(mask_path))
+            # Save tile and three mask types
+            img_path = images_dir / f"{tile_name}.{output_format}"
+            (Image.fromarray(np.array(tile_img)) if isinstance(tile_img, np.ndarray) else tile_img).save(str(img_path), output_format.upper(), compress_level=compression)
+
+            # Binary mask
+            binary_mask_path = masks_dir / f"{tile_name}_mask.png"
+            Image.fromarray(binary_mask, 'L').save(binary_mask_path, 'PNG', compress_level=compression)
+
+            # Class mask
+            class_mask_path = class_masks_dir / f"{tile_name}_class.png"
+            Image.fromarray(class_mask, 'L').save(class_mask_path, 'PNG', compress_level=compression)
+
+            # Instance mask (uint16)
+            instance_mask_path = instance_masks_dir / f"{tile_name}_instance.png"
+            Image.fromarray(instance_mask, 'I;16').save(instance_mask_path, 'PNG')
+
             tiles_saved += 1
 
             # Record in registry (always for annotated tiles, or for saved tissue tiles)
             tile_registry.append({
                 'type': 'grid',
                 'image': str(img_path.relative_to(slide_output_dir)),
-                'mask': str(mask_path.relative_to(slide_output_dir)),
+                'mask_binary': str(binary_mask_path.relative_to(slide_output_dir)),
+                'mask_class': str(class_mask_path.relative_to(slide_output_dir)),
+                'mask_instance': str(instance_mask_path.relative_to(slide_output_dir)),
                 'origin_native': [x, y],
+                'bbox_native': [x, y, x_end, y_end],
                 'tile_index': tile_idx,
                 'has_annotations': has_annotations,
                 'glomeruli': tile_glomeruli
@@ -701,34 +747,50 @@ def process_slide_pair(
             cx, cy = compute_polygon_centroid(glom_data['coordinates'])
 
             # Tile box centered on glomerulus
-            x = int(max(0, cx - tile_size / 2))
-            y = int(max(0, cy - tile_size / 2))
-            x = min(x, width - tile_size)
-            y = min(y, height - tile_size)
-            x_end, y_end = x + tile_size, y + tile_size
+            x = int(max(0, cx - native_tile_size / 2))
+            y = int(max(0, cy - native_tile_size / 2))
+            x = max(0, min(x, width - native_tile_size))
+            y = max(0, min(y, height - native_tile_size))
+            x_end, y_end = x + native_tile_size, y + native_tile_size
 
             # Calculate real coverage in the centered tile (not placeholder 0.0)
             update_coverage_for_centered_tile(glom_id, glom_data['coordinates'], (x, y, x_end, y_end), assignments)
 
             tile_name = f"{stem}_centered_g{glom_id:04d}"
             if fmt == 'openslide':
-                tile_img = extract_tile_openslide(slide, x, y, tile_size)
+                tile_img = extract_tile_openslide(slide, x, y, native_tile_size)
+            elif fmt == 'tifffile':
+                tile_img = extract_tile_tifffile(slide, x, y, native_tile_size)
             else:
-                tile_img = extract_tile_pil(slide, x, y, tile_size)
+                tile_img = extract_tile_pil(slide, x, y, native_tile_size)
 
-            mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
+            # Resize to output tile_size if needed
+            if tile_img.size != (tile_size, tile_size):
+                tile_img = tile_img.resize((tile_size, tile_size), Image.Resampling.LANCZOS)
+
+            binary_mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
+            class_mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
+            instance_mask = np.zeros((tile_size, tile_size), dtype=np.uint16)
             tile_glomeruli = []
 
-            for gid, gdata in enumerate(glomeruli):
+            for idx, gdata in enumerate(glomeruli, start=1):
                 cov = compute_coverage(gdata['coordinates'], (x, y, x_end, y_end))
                 if cov > 0:
                     glom_mask = rasterize_polygon(
                         gdata['coordinates'],
                         (x, y, x_end, y_end),
-                        tile_size
+                        tile_size,
+                        zoom_scale
                     )
-                    # Combine masks using explicit priority (not implicit np.maximum)
-                    mask = combine_masks_with_priority(mask, glom_mask, gdata['class_id'])
+                    # Vectorized binary union
+                    np.maximum(binary_mask, glom_mask, out=binary_mask)
+                    # Set class_id where annotation exists
+                    class_id = gdata['class_id']
+                    class_mask[glom_mask > 0] = class_id
+                    # Assign instance_id (first annotation wins per pixel)
+                    instance_mask[(glom_mask > 0) & (instance_mask == 0)] = idx
+
+                    gid = gdata['id']
 
                     role = 'primary' if gid == glom_id else 'secondary'
                     tile_glomeruli.append({
@@ -738,17 +800,30 @@ def process_slide_pair(
                         'role': role
                     })
 
-            # Save
-            img_path = images_dir / f"{tile_name}.{OUTPUT_FORMAT}"
-            mask_path = masks_dir / f"{tile_name}_mask.{OUTPUT_FORMAT}"
-            save_tile_image(tile_img, str(img_path))
-            save_tile_mask(mask, str(mask_path))
+            # Save tile and three mask types
+            img_path = images_dir / f"{tile_name}.{output_format}"
+            (Image.fromarray(np.array(tile_img)) if isinstance(tile_img, np.ndarray) else tile_img).save(str(img_path), output_format.upper(), compress_level=compression)
+
+            # Binary mask
+            binary_mask_path = masks_dir / f"{tile_name}_mask.png"
+            Image.fromarray(binary_mask, 'L').save(binary_mask_path, 'PNG', compress_level=compression)
+
+            # Class mask
+            class_mask_path = class_masks_dir / f"{tile_name}_class.png"
+            Image.fromarray(class_mask, 'L').save(class_mask_path, 'PNG', compress_level=compression)
+
+            # Instance mask (uint16)
+            instance_mask_path = instance_masks_dir / f"{tile_name}_instance.png"
+            Image.fromarray(instance_mask, 'I;16').save(instance_mask_path, 'PNG')
 
             tile_registry.append({
                 'type': 'centered',
                 'image': str(img_path.relative_to(slide_output_dir)),
-                'mask': str(mask_path.relative_to(slide_output_dir)),
+                'mask_binary': str(binary_mask_path.relative_to(slide_output_dir)),
+                'mask_class': str(class_mask_path.relative_to(slide_output_dir)),
+                'mask_instance': str(instance_mask_path.relative_to(slide_output_dir)),
                 'origin_native': [x, y],
+                'bbox_native': [x, y, x_end, y_end],
                 'glomerulus_id': glom_id,
                 'glomeruli': tile_glomeruli
             })
@@ -784,21 +859,32 @@ def process_slide_pair(
             'slide': stem,
             'width_native': width,
             'height_native': height,
-            'tile_size': tile_size,
-            'zoom_scale': zoom_scale,
-            'stride': stride,
-            'class_map': CANONICAL_CLASS_MAP,
+            'class_map': class_map,
             'n_glomeruli': len(glomeruli),
             'n_grid_tiles': len(grid_tiles),
             'n_centered_tiles': len(centered_glom_ids),
             'otsu_applied': otsu_mask is not None,
             'glomeruli_coverage': glomeruli_coverage,
+            'tiling_config': {
+                'tile_size': tile_size,
+                'zoom_scale': zoom_scale,
+                'stride': stride,
+                'min_coverage_pct': min_coverage_pct,
+                'output_format': output_format,
+                'compression': compression,
+                'otsu_min_ratio': otsu_min_ratio,
+                'bg_threshold': bg_threshold,
+                'downsample_factor': downsample_factor,
+            },
             'tiles': tile_registry
         }
 
         annotations_path = slide_output_dir / 'annotations.json'
         with open(annotations_path, 'w') as f:
             json.dump(annotations, f, indent=2)
+
+        # Write _SUCCESS sentinel to mark complete processing
+        (slide_output_dir / "_SUCCESS").write_text("ok\n")
 
         logger.info(f"[{stem}] ✓ Complete: {len(grid_tiles)} grid + {len(centered_glom_ids)} centered = "
                    f"{len(grid_tiles) + len(centered_glom_ids)} total tiles")
@@ -827,7 +913,15 @@ def dynamic_schedule(
     class_map: Dict[str, int],
     ram_fraction: float = 0.5,
     tile_size: int = TILE_SIZE,
-    max_workers: int = None
+    zoom_scale: float = ZOOM_SCALE,
+    stride: int = STRIDE,
+    max_workers: int = None,
+    min_coverage_pct: float = MIN_COVERAGE_PCT,
+    output_format: str = OUTPUT_FORMAT,
+    compression: int = COMPRESSION,
+    otsu_min_ratio: float = OTSU_MIN_RATIO,
+    bg_threshold: float = BG_THRESHOLD,
+    downsample_factor: int = DOWNSAMPLE_FACTOR
 ) -> List[Dict]:
     """Process pairs with dynamic worker admission based on available RAM."""
     queue = deque(sorted(pairs, key=lambda p: os.path.getsize(p['image_path']), reverse=False))
@@ -855,7 +949,15 @@ def dynamic_schedule(
                     pair,
                     output_dir,
                     class_map,
-                    tile_size
+                    tile_size,
+                    zoom_scale,
+                    stride,
+                    min_coverage_pct,
+                    output_format,
+                    compression,
+                    otsu_min_ratio,
+                    bg_threshold,
+                    downsample_factor
                 )
                 active[future] = (pair, mem_estimate)
                 used_ram_gb += mem_estimate
@@ -896,14 +998,31 @@ def dynamic_schedule(
 # ============================================================================
 
 def slide_already_processed(stem: str, output_dir: str) -> bool:
-    """Check if a slide's output directory exists with tiles."""
-    slide_dir = Path(output_dir) / stem
-    images_dir = slide_dir / 'images'
-    return images_dir.exists() and list(images_dir.glob('*.png'))
+    """Check if a slide has been fully processed (marked by _SUCCESS sentinel)."""
+    return (Path(output_dir) / stem / "_SUCCESS").exists()
+
+def load_config(config_path: str) -> Dict:
+    """Load configuration from YAML file. Falls back to defaults if file not found."""
+    try:
+        with open(config_path, 'r') as f:
+            config = yaml.safe_load(f)
+            logger.info(f"Loaded config from {config_path}")
+            return config if config else {}
+    except FileNotFoundError:
+        logger.warning(f"Config file {config_path} not found, using defaults")
+        return {}
+    except Exception as e:
+        logger.warning(f"Error loading config file {config_path}: {e}, using defaults")
+        return {}
 
 def main():
     parser = argparse.ArgumentParser(
         description='Generate tiled training data for UNet from WSI + GeoJSON annotations'
+    )
+    parser.add_argument(
+        '--config',
+        default='config.yaml',
+        help='Path to config file (YAML)'
     )
     parser.add_argument(
         '--input', '-i',
@@ -918,19 +1037,19 @@ def main():
     parser.add_argument(
         '--tile-size',
         type=int,
-        default=TILE_SIZE,
+        default=None,
         help='Tile size in pixels (at zoom_scale)'
     )
     parser.add_argument(
         '--zoom-scale',
         type=float,
-        default=ZOOM_SCALE,
+        default=None,
         help='Zoom scale (1 tile pixel = 1/zoom_scale native pixels)'
     )
     parser.add_argument(
         '--stride',
         type=int,
-        default=STRIDE,
+        default=None,
         help='Stride between tiles (default = tile_size - overlap for 50% overlap)'
     )
     parser.add_argument(
@@ -959,6 +1078,33 @@ def main():
 
     args = parser.parse_args()
 
+    # Load configuration from YAML file
+    config = load_config(args.config)
+
+    # Merge config with CLI args (CLI args take precedence if explicitly provided)
+    tile_size = args.tile_size if args.tile_size is not None else config.get('tile_size', TILE_SIZE)
+    zoom_scale = args.zoom_scale if args.zoom_scale is not None else config.get('zoom_scale', ZOOM_SCALE)
+    stride = args.stride if args.stride is not None else config.get('stride', STRIDE)
+    min_coverage_pct = config.get('min_coverage_pct', MIN_COVERAGE_PCT)
+    output_format = config.get('output_format', OUTPUT_FORMAT)
+    compression = config.get('compression', COMPRESSION)
+
+    # Load tissue filter parameters from config
+    tissue_filter_cfg = config.get('tissue_filter', {})
+    otsu_min_ratio = tissue_filter_cfg.get('otsu_min_ratio', OTSU_MIN_RATIO)
+    bg_threshold = tissue_filter_cfg.get('bg_threshold', BG_THRESHOLD)
+    downsample_factor = tissue_filter_cfg.get('downsample_factor', DOWNSAMPLE_FACTOR)
+
+    # Load class map from config (if provided), otherwise use canonical
+    class_map = config.get('class_map')
+    if not class_map:
+        class_map = get_canonical_class_map()
+    else:
+        logger.info(f"Using class map from config: {class_map}")
+
+    logger.info(f"Config: tile_size={tile_size}, zoom_scale={zoom_scale}, stride={stride}")
+    logger.info(f"Tissue filter: otsu_min_ratio={otsu_min_ratio}, bg_threshold={bg_threshold}, downsample_factor={downsample_factor}")
+
     # Find pairs
     pairs = find_tiff_geojson_pairs(args.input)
     if not pairs:
@@ -980,9 +1126,6 @@ def main():
         pairs = pairs[:args.max_slides]
         logger.info(f"Processing first {len(pairs)} slides (--max-slides)")
 
-    # Get canonical class map (fixed, no scanning needed)
-    class_map = get_canonical_class_map()
-
     # Schedule processing
     os.makedirs(args.output, exist_ok=True)
     results = dynamic_schedule(
@@ -990,9 +1133,60 @@ def main():
         args.output,
         class_map,
         ram_fraction=args.ram_fraction,
-        tile_size=args.tile_size,
-        max_workers=args.workers
+        tile_size=tile_size,
+        zoom_scale=zoom_scale,
+        stride=stride,
+        max_workers=args.workers,
+        min_coverage_pct=min_coverage_pct,
+        output_format=output_format,
+        compression=compression,
+        otsu_min_ratio=otsu_min_ratio,
+        bg_threshold=bg_threshold,
+        downsample_factor=downsample_factor
     )
+
+    # Aggregate dataset summary from all annotations.json files
+    dataset_summary = {
+        'n_slides': 0,
+        'n_tiles_total': 0,
+        'n_tiles_positive': 0,
+        'n_tiles_negative': 0,
+        'class_counts': {}
+    }
+
+    output_path = Path(args.output)
+    for slide_dir in output_path.iterdir():
+        if not slide_dir.is_dir():
+            continue
+        if not (slide_dir / '_SUCCESS').exists():
+            continue
+        annotations_file = slide_dir / 'annotations.json'
+        if annotations_file.exists():
+            try:
+                with open(annotations_file, 'r') as f:
+                    annotations = json.load(f)
+
+                dataset_summary['n_slides'] += 1
+
+                if 'tiles' in annotations:
+                    for tile in annotations['tiles']:
+                        dataset_summary['n_tiles_total'] += 1
+                        if tile.get('has_annotations', False):
+                            dataset_summary['n_tiles_positive'] += 1
+                        else:
+                            dataset_summary['n_tiles_negative'] += 1
+
+                if 'glomeruli_coverage' in annotations:
+                    for _, glom_data in annotations['glomeruli_coverage'].items():
+                        class_name = glom_data.get('class', 'unknown')
+                        dataset_summary['class_counts'][class_name] = dataset_summary['class_counts'].get(class_name, 0) + 1
+            except Exception as e:
+                logger.warning(f"Failed to read {annotations_file}: {e}")
+
+    summary_path = output_path / 'dataset_summary.json'
+    with open(summary_path, 'w') as f:
+        json.dump(dataset_summary, f, indent=2)
+    logger.info(f"Wrote dataset summary to {summary_path}")
 
     # Summary
     successes = [r for r in results if r['status'] == 'success']
