@@ -9,8 +9,12 @@ from typing import Optional, Tuple, Dict, Any
 import os
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFile
 from tqdm import tqdm
+
+# Allow PIL to load truncated images with corrupted metadata
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+ImageFile.MAX_BLOCK_SIZE = 2**20 * 100  # 100 MB blocks
 
 try:
     import psutil

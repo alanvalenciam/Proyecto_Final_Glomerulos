@@ -14,6 +14,12 @@ from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from PIL import Image
 import psutil
 
+# Increase PIL's limit for PNG chunk decompression (default 128 KB → 10 MB)
+Image.MAX_IMAGE_PIXELS = None
+Image.Resampling = Image.Resampling if hasattr(Image, 'Resampling') else Image
+import PIL
+PIL.Image.MAX_TEXT_CHUNK = 10 * 1024 * 1024  # 10 MB
+
 try:
     import openslide
 except ImportError:
@@ -45,7 +51,7 @@ Image.MAX_IMAGE_PIXELS = None
 
 # Configuration
 TILE_SIZE = 1024
-ZOOM_SCALE = 0.5
+ZOOM_SCALE = 0.8
 STRIDE = 1024
 MIN_COVERAGE_PCT = 60.0
 OUTPUT_FORMAT = 'png'
