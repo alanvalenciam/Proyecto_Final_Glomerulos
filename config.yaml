@@ -16,3 +16,10 @@ class_map:
   Proliferativo: 2
   Esclerosado: 3
   Excluido: 4
+
+class_colors:
+  background: "#000000"
+  No_Proliferativo: "#ee8718"
+  Proliferativo: "#00ffff"
+  Esclerosado: "#ff00ff"
+  Excluido: "#00ff00"

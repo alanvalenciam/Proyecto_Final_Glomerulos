@@ -29,11 +29,6 @@ try:
 except ImportError:
     raise ImportError("opencv-python is required: pip install opencv-python")
 
-try:
-    from skimage import draw
-    SKIMAGE_AVAILABLE = True
-except ImportError:
-    SKIMAGE_AVAILABLE = False
 
 try:
     from shapely.geometry import box, Polygon
@@ -55,6 +50,15 @@ STRIDE = 512
 MIN_COVERAGE_PCT = 60.0
 OUTPUT_FORMAT = 'png'
 COMPRESSION = 0
+
+# Default RGB color map for masks (hex → RGB tuple)
+DEFAULT_CLASS_COLORS = {
+    'background':       '#000000',
+    'No_Proliferativo': '#ee8718',
+    'Proliferativo':    '#00ffff',
+    'Esclerosado':      '#ff00ff',
+    'Excluido':         '#00ff00',
+}
 
 LARGE_FILE_THRESHOLD = 300 * 1024 * 1024  # 300 MB
 
@@ -82,6 +86,7 @@ CLASS_NAME_NORMALIZE = {
     # Excluido
     'exclude': 'Excluido',
     'excluido': 'Excluido',
+    'excluyente': 'Excluido',
     'excluded': 'Excluido',
 }
 
@@ -334,6 +339,40 @@ def get_canonical_class_map() -> Dict[str, int]:
     logger.info(f"Using canonical class map: {CANONICAL_CLASS_MAP}")
     return CANONICAL_CLASS_MAP
 
+def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
+    """Convert hex color string (#RRGGBB) to RGB tuple with validation."""
+    # Strip whitespace and remove leading # if present
+    hex_color = hex_color.strip()
+    if hex_color.startswith('#'):
+        hex_color = hex_color[1:]
+
+    # Validate: exactly 6 characters
+    if len(hex_color) != 6:
+        raise ValueError(f"Invalid hex color: {hex_color}. Expected 6 hex digits (e.g., 'ee8718').")
+
+    # Validate: only hex digits (0-9, a-f, A-F)
+    if not all(c in '0123456789abcdefABCDEF' for c in hex_color):
+        raise ValueError(f"Invalid hex color: {hex_color}. Must contain only hex digits (0-9, a-f).")
+
+    # Convert to RGB tuple
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+def generate_rgb_mask(
+    binary_mask: np.ndarray,
+    class_mask: np.ndarray,
+    id_to_rgb: Dict[int, Tuple[int, int, int]],
+    bg_rgb: Tuple[int, int, int]
+) -> Image.Image:
+    """Generate RGB mask from binary and class masks using precomputed color palette."""
+    rgb_mask = np.zeros((binary_mask.shape[0], binary_mask.shape[1], 3), dtype=np.uint8)
+    rgb_mask[binary_mask == 0] = bg_rgb
+
+    for class_id, rgb in id_to_rgb.items():
+        mask_pixels = class_mask == class_id
+        rgb_mask[mask_pixels] = rgb
+
+    return Image.fromarray(rgb_mask, 'RGB')
+
 # ============================================================================
 # Tiling and mask generation
 # ============================================================================
@@ -543,6 +582,7 @@ def process_slide_pair(
     pair: Dict,
     output_dir: str,
     class_map: Dict[str, int],
+    class_colors: Dict[str, str],
     tile_size: int = TILE_SIZE,
     zoom_scale: float = ZOOM_SCALE,
     stride: int = STRIDE,
@@ -628,16 +668,20 @@ def process_slide_pair(
         centered_glom_ids = [gid for gid, asg in assignments.items() if asg['needs_centered_tile']]
         logger.info(f"[{stem}] {len(centered_glom_ids)} glomeruli need centered tiles")
 
-        # Create output directory
+        # Create output directories
         slide_output_dir = Path(output_dir) / stem
         images_dir = slide_output_dir / 'images'
-        masks_dir = slide_output_dir / 'masks_binary'
-        class_masks_dir = slide_output_dir / 'masks_class'
-        instance_masks_dir = slide_output_dir / 'masks_instance'
+        masks_dir = slide_output_dir / 'masks'
         images_dir.mkdir(parents=True, exist_ok=True)
         masks_dir.mkdir(parents=True, exist_ok=True)
-        class_masks_dir.mkdir(parents=True, exist_ok=True)
-        instance_masks_dir.mkdir(parents=True, exist_ok=True)
+
+        # Precompute color palette once per slide (not per tile)
+        id_to_name = {v: k for k, v in class_map.items()}
+        id_to_rgb = {}
+        for class_id, class_name in id_to_name.items():
+            hex_color = class_colors.get(class_name, '#000000')
+            id_to_rgb[class_id] = hex_to_rgb(hex_color)
+        bg_rgb = hex_to_rgb(class_colors.get('background', '#000000'))
 
         # Build tile registry for metadata
         tile_registry = []
@@ -663,10 +707,9 @@ def process_slide_pair(
 
             binary_mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
             class_mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
-            instance_mask = np.zeros((tile_size, tile_size), dtype=np.uint16)
             tile_glomeruli = []
 
-            for idx, glom_data in enumerate(glomeruli, start=1):
+            for glom_data in glomeruli:
                 cov = compute_coverage(glom_data['coordinates'], (x, y, x_end, y_end))
                 if cov > 0:
                     glom_mask = rasterize_polygon(
@@ -680,8 +723,6 @@ def process_slide_pair(
                     # Set class_id where annotation exists
                     class_id = glom_data['class_id']
                     class_mask[glom_mask > 0] = class_id
-                    # Assign instance_id (first annotation wins per pixel)
-                    instance_mask[(glom_mask > 0) & (instance_mask == 0)] = idx
 
                     glom_id = glom_data['id']
 
@@ -706,31 +747,22 @@ def process_slide_pair(
                     tiles_skipped += 1
                     continue
 
-            # Save tile and three mask types
+            # Save tile image
             img_path = images_dir / f"{tile_name}.{output_format}"
             (Image.fromarray(np.array(tile_img)) if isinstance(tile_img, np.ndarray) else tile_img).save(str(img_path), output_format.upper(), compress_level=compression)
 
-            # Binary mask
-            binary_mask_path = masks_dir / f"{tile_name}_mask.png"
-            Image.fromarray(binary_mask, 'L').save(binary_mask_path, 'PNG', compress_level=compression)
-
-            # Class mask
-            class_mask_path = class_masks_dir / f"{tile_name}_class.png"
-            Image.fromarray(class_mask, 'L').save(class_mask_path, 'PNG', compress_level=compression)
-
-            # Instance mask (uint16)
-            instance_mask_path = instance_masks_dir / f"{tile_name}_instance.png"
-            Image.fromarray(instance_mask, 'I;16').save(instance_mask_path, 'PNG')
+            # Generate and save RGB-colored mask
+            rgb_mask = generate_rgb_mask(binary_mask, class_mask, id_to_rgb, bg_rgb)
+            mask_path = masks_dir / f"{tile_name}_mask.png"
+            rgb_mask.save(mask_path, 'PNG', compress_level=compression)
 
             tiles_saved += 1
 
-            # Record in registry (always for annotated tiles, or for saved tissue tiles)
+            # Record in registry
             tile_registry.append({
                 'type': 'grid',
                 'image': str(img_path.relative_to(slide_output_dir)),
-                'mask_binary': str(binary_mask_path.relative_to(slide_output_dir)),
-                'mask_class': str(class_mask_path.relative_to(slide_output_dir)),
-                'mask_instance': str(instance_mask_path.relative_to(slide_output_dir)),
+                'mask': str(mask_path.relative_to(slide_output_dir)),
                 'origin_native': [x, y],
                 'bbox_native': [x, y, x_end, y_end],
                 'tile_index': tile_idx,
@@ -770,10 +802,9 @@ def process_slide_pair(
 
             binary_mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
             class_mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
-            instance_mask = np.zeros((tile_size, tile_size), dtype=np.uint16)
             tile_glomeruli = []
 
-            for idx, gdata in enumerate(glomeruli, start=1):
+            for gdata in glomeruli:
                 cov = compute_coverage(gdata['coordinates'], (x, y, x_end, y_end))
                 if cov > 0:
                     glom_mask = rasterize_polygon(
@@ -787,8 +818,6 @@ def process_slide_pair(
                     # Set class_id where annotation exists
                     class_id = gdata['class_id']
                     class_mask[glom_mask > 0] = class_id
-                    # Assign instance_id (first annotation wins per pixel)
-                    instance_mask[(glom_mask > 0) & (instance_mask == 0)] = idx
 
                     gid = gdata['id']
 
@@ -800,31 +829,23 @@ def process_slide_pair(
                         'role': role
                     })
 
-            # Save tile and three mask types
+            # Save tile image
             img_path = images_dir / f"{tile_name}.{output_format}"
             (Image.fromarray(np.array(tile_img)) if isinstance(tile_img, np.ndarray) else tile_img).save(str(img_path), output_format.upper(), compress_level=compression)
 
-            # Binary mask
-            binary_mask_path = masks_dir / f"{tile_name}_mask.png"
-            Image.fromarray(binary_mask, 'L').save(binary_mask_path, 'PNG', compress_level=compression)
-
-            # Class mask
-            class_mask_path = class_masks_dir / f"{tile_name}_class.png"
-            Image.fromarray(class_mask, 'L').save(class_mask_path, 'PNG', compress_level=compression)
-
-            # Instance mask (uint16)
-            instance_mask_path = instance_masks_dir / f"{tile_name}_instance.png"
-            Image.fromarray(instance_mask, 'I;16').save(instance_mask_path, 'PNG')
+            # Generate and save RGB-colored mask
+            rgb_mask = generate_rgb_mask(binary_mask, class_mask, id_to_rgb, bg_rgb)
+            mask_path = masks_dir / f"{tile_name}_mask.png"
+            rgb_mask.save(mask_path, 'PNG', compress_level=compression)
 
             tile_registry.append({
                 'type': 'centered',
                 'image': str(img_path.relative_to(slide_output_dir)),
-                'mask_binary': str(binary_mask_path.relative_to(slide_output_dir)),
-                'mask_class': str(class_mask_path.relative_to(slide_output_dir)),
-                'mask_instance': str(instance_mask_path.relative_to(slide_output_dir)),
+                'mask': str(mask_path.relative_to(slide_output_dir)),
                 'origin_native': [x, y],
                 'bbox_native': [x, y, x_end, y_end],
                 'glomerulus_id': glom_id,
+                'has_annotations': len(tile_glomeruli) > 0,
                 'glomeruli': tile_glomeruli
             })
 
@@ -860,6 +881,7 @@ def process_slide_pair(
             'width_native': width,
             'height_native': height,
             'class_map': class_map,
+            'class_colors': class_colors,
             'n_glomeruli': len(glomeruli),
             'n_grid_tiles': len(grid_tiles),
             'n_centered_tiles': len(centered_glom_ids),
@@ -911,6 +933,7 @@ def dynamic_schedule(
     pairs: List[Dict],
     output_dir: str,
     class_map: Dict[str, int],
+    class_colors: Dict[str, str],
     ram_fraction: float = 0.5,
     tile_size: int = TILE_SIZE,
     zoom_scale: float = ZOOM_SCALE,
@@ -949,6 +972,7 @@ def dynamic_schedule(
                     pair,
                     output_dir,
                     class_map,
+                    class_colors,
                     tile_size,
                     zoom_scale,
                     stride,
@@ -996,6 +1020,12 @@ def dynamic_schedule(
 # ============================================================================
 # CLI
 # ============================================================================
+
+def validate_class_colors(class_map: Dict[str, int], class_colors: Dict[str, str]) -> None:
+    """Validate that all classes in class_map have corresponding colors defined."""
+    missing = [name for name in class_map.keys() if name not in class_colors]
+    if missing:
+        raise ValueError(f"Missing colors for classes: {missing}")
 
 def slide_already_processed(stem: str, output_dir: str) -> bool:
     """Check if a slide has been fully processed (marked by _SUCCESS sentinel)."""
@@ -1102,6 +1132,13 @@ def main():
     else:
         logger.info(f"Using class map from config: {class_map}")
 
+    # Load class colors from config for RGB masks
+    class_colors = config.get('class_colors', DEFAULT_CLASS_COLORS)
+    logger.info(f"Using class colors: {class_colors}")
+
+    # Validate that all classes have colors
+    validate_class_colors(class_map, class_colors)
+
     logger.info(f"Config: tile_size={tile_size}, zoom_scale={zoom_scale}, stride={stride}")
     logger.info(f"Tissue filter: otsu_min_ratio={otsu_min_ratio}, bg_threshold={bg_threshold}, downsample_factor={downsample_factor}")
 
@@ -1132,6 +1169,7 @@ def main():
         pairs,
         args.output,
         class_map,
+        class_colors,
         ram_fraction=args.ram_fraction,
         tile_size=tile_size,
         zoom_scale=zoom_scale,
