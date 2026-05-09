@@ -9,7 +9,7 @@ from typing import Optional, Tuple, Dict, Any
 import os
 
 import numpy as np
-from PIL import Image, ImageDraw
+from PIL import Image
 from tqdm import tqdm
 
 try:
@@ -18,20 +18,8 @@ try:
 except ImportError:
     HAS_PSUTIL = False
 
-# Legend drawing constants
-LEGEND_BOX_SIZE = 40
-LEGEND_ITEM_SPACING = 12
-LEGEND_WIDTH = 320
-LEGEND_MARGIN = 20
-
 # Memory estimation constants
 DEFAULT_SLIDE_MEMORY_ESTIMATE = 500 * 1024**2  # 500 MB default
-
-
-def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
-    """Convert hex color '#RRGGBB' to (R, G, B) tuple."""
-    hex_color = hex_color.lstrip('#')
-    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
 
 def calculate_scaled_tile_dimensions(tile_width: int, tile_height: int, zoom_scale: float, recon_scale: int) -> Tuple[int, int]:
@@ -43,55 +31,33 @@ def calculate_scaled_tile_dimensions(tile_width: int, tile_height: int, zoom_sca
     return tile_w_scaled, tile_h_scaled
 
 
-def draw_legend(
+def create_mask_overlay(
     image: Image.Image,
-    class_map: Dict[str, int],
-    class_colors: Dict[str, str],
-) -> None:
-    """Draw legend showing class colors and names on image."""
-    draw = ImageDraw.Draw(image, 'RGBA')
+    gray_mask: Image.Image,
+    overlay_alpha: int = 180
+) -> Image.Image:
+    """Composite grayscale mask overlay onto image."""
+    # Convert image to RGBA
+    img_rgba = image.convert('RGBA')
 
-    # Sort by class ID to ensure consistent order
-    sorted_classes = sorted(class_map.items(), key=lambda item: item[1])
-    non_bg_classes = [c for c in sorted_classes if c[0] != 'background']
+    # Convert grayscale mask to RGB, then to RGBA with transparency
+    gray_arr = np.array(gray_mask)
+    rgb_arr = np.stack([gray_arr, gray_arr, gray_arr], axis=-1).astype(np.uint8)
 
-    if not non_bg_classes:
-        return
+    # Create RGBA with alpha = overlay_alpha where mask is not background (0)
+    h, w = gray_arr.shape
+    rgba_arr = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba_arr[:, :, :3] = rgb_arr
 
-    # Calculate legend dimensions
-    legend_height = LEGEND_MARGIN + (len(non_bg_classes) * (LEGEND_BOX_SIZE + LEGEND_ITEM_SPACING)) + LEGEND_MARGIN
+    # Only apply alpha where there's annotation (mask != 0)
+    alpha_arr = np.where(gray_arr > 0, overlay_alpha, 0).astype(np.uint8)
+    rgba_arr[:, :, 3] = alpha_arr
 
-    # Draw semi-transparent black background for legend
-    draw.rectangle(
-        [LEGEND_MARGIN - 5, LEGEND_MARGIN - 5, LEGEND_MARGIN + LEGEND_WIDTH, LEGEND_MARGIN + legend_height],
-        fill=(0, 0, 0, 220)
-    )
+    mask_rgba = Image.fromarray(rgba_arr, 'RGBA')
 
-    y = LEGEND_MARGIN
-    x = LEGEND_MARGIN + 10
-
-    for class_name, class_id in non_bg_classes:
-        hex_color = class_colors.get(class_name, '#ffffff')
-        r, g, b = hex_to_rgb(hex_color)
-
-        # Draw colored rectangle
-        draw.rectangle(
-            [x, y, x + LEGEND_BOX_SIZE, y + LEGEND_BOX_SIZE],
-            fill=(r, g, b, 255),
-            outline='white'
-        )
-
-        # Draw class name text - larger and bold
-        text = class_name.replace('_', ' ')
-        text_x = x + LEGEND_BOX_SIZE + 15
-        text_y = y + 8
-
-        # Draw text with black outline for visibility
-        for adj_x, adj_y in [(-1, -1), (-1, 1), (1, -1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)]:
-            draw.text((text_x + adj_x, text_y + adj_y), text, fill='black')
-        draw.text((text_x, text_y), text, fill='white')
-
-        y += LEGEND_BOX_SIZE + LEGEND_ITEM_SPACING
+    # Composite
+    overlay = Image.alpha_composite(img_rgba, mask_rgba)
+    return overlay.convert('RGB')
 
 
 class MemoryMonitor:
@@ -190,8 +156,6 @@ def reconstruct_slide(
     native_width = annotations.get('width_native', 0)
     native_height = annotations.get('height_native', 0)
     tiles = annotations.get('tiles', [])
-    class_map = annotations.get('class_map', {})
-    class_colors = annotations.get('class_colors', {})
     tiling_config = annotations.get('tiling_config', {})
     zoom_scale = tiling_config.get('zoom_scale', 1.0)
 
@@ -202,7 +166,7 @@ def reconstruct_slide(
     canvas_height = max(1, native_height // recon_scale)
 
     wsi_img = Image.new('RGB', (canvas_width, canvas_height), (255, 255, 255))
-    mask_canvas = Image.new('RGBA', (canvas_width, canvas_height), (0, 0, 0, 0))
+    mask_canvas = Image.new('L', (canvas_width, canvas_height), 0)
 
     for tile_data in tiles:
         image_path = slide_dir / tile_data.get('image', '')
@@ -229,37 +193,14 @@ def reconstruct_slide(
 
         if mask_path.exists():
             try:
-                tile_mask = Image.open(mask_path).convert('RGB')
+                tile_mask = Image.open(mask_path).convert('L')
                 w_s, h_s = calculate_scaled_tile_dimensions(
                     tile_mask.width, tile_mask.height, zoom_scale, recon_scale
                 )
                 tile_mask_scaled = tile_mask.resize(
                     (w_s, h_s), Image.NEAREST
                 )
-
-                # Make black background pixels transparent
-                tile_mask_rgba = tile_mask_scaled.convert('RGBA')
-                mask_arr = np.array(tile_mask_rgba)
-                is_black = (
-                    (mask_arr[:, :, 0] == 0) &
-                    (mask_arr[:, :, 1] == 0) &
-                    (mask_arr[:, :, 2] == 0)
-                )
-                alpha_arr = np.where(is_black, 0, overlay_alpha)
-                tile_mask_rgba.putalpha(
-                    Image.fromarray(alpha_arr.astype(np.uint8))
-                )
-
-                # Composite tile onto main mask canvas
-                tile_canvas = Image.new(
-                    'RGBA', (canvas_width, canvas_height), (0, 0, 0, 0)
-                )
-                tile_canvas.paste(
-                    tile_mask_rgba, scaled_origin, tile_mask_rgba
-                )
-                mask_canvas = Image.alpha_composite(
-                    mask_canvas, tile_canvas
-                )
+                mask_canvas.paste(tile_mask_scaled, scaled_origin)
 
             except (IOError, OSError) as e:
                 msg = f"  ⚠️  Warning: Failed to load mask {mask_path}: {e}"
@@ -272,27 +213,19 @@ def reconstruct_slide(
         recon_path = (
             output_recon_dir / f"{slide_name}_reconstruction.png"
         )
-        mask_colored_path = (
-            output_recon_dir / f"{slide_name}_mask_colored.png"
+        mask_path = (
+            output_recon_dir / f"{slide_name}_mask.png"
         )
-        overlay_path = output_recon_dir / f"{slide_name}_overlay.png"
+        overlay_path = (
+            output_recon_dir / f"{slide_name}_overlay.png"
+        )
 
         wsi_img.save(recon_path, 'PNG')
+        mask_canvas.save(mask_path, 'PNG')
 
-        # Save colored mask
-        mask_rgb_out = mask_canvas.convert('RGB')
-        mask_rgb_out.save(mask_colored_path, 'PNG')
-
-        # Create colored overlay
-        wsi_rgba = wsi_img.convert('RGBA')
-        overlay_canvas = Image.alpha_composite(wsi_rgba, mask_canvas)
-        overlay_rgb = overlay_canvas.convert('RGB')
-
-        # Draw legend if class info available
-        if class_map and class_colors:
-            draw_legend(overlay_rgb, class_map, class_colors)
-
-        overlay_rgb.save(overlay_path, 'PNG')
+        # Create and save overlay (image + grayscale mask semi-transparent)
+        overlay = create_mask_overlay(wsi_img, mask_canvas, overlay_alpha)
+        overlay.save(overlay_path, 'PNG')
 
         mem_end = 0
         if HAS_PSUTIL:
@@ -302,10 +235,7 @@ def reconstruct_slide(
                 mem_end = mem_start
         mem_used = mem_end - mem_start
 
-        msg = (
-            f"{slide_name}: 3 outputs saved "
-            "(reconstruction + colored_mask + overlay)"
-        )
+        msg = f"{slide_name}: reconstruction + grayscale mask + overlay saved"
         return True, msg, mem_used
 
     except (IOError, OSError) as e:

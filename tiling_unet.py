@@ -46,18 +46,18 @@ Image.MAX_IMAGE_PIXELS = None
 # Configuration
 TILE_SIZE = 1024
 ZOOM_SCALE = 0.5
-STRIDE = 512
+STRIDE = 1024
 MIN_COVERAGE_PCT = 60.0
 OUTPUT_FORMAT = 'png'
 COMPRESSION = 0
 
-# Default RGB color map for masks (hex → RGB tuple)
-DEFAULT_CLASS_COLORS = {
-    'background':       '#000000',
-    'No_Proliferativo': '#ee8718',
-    'Proliferativo':    '#00ffff',
-    'Esclerosado':      '#ff00ff',
-    'Excluido':         '#00ff00',
+# Default grayscale values for semantic segmentation masks
+DEFAULT_CLASS_GRAY_VALUES = {
+    'background':       0,
+    'No_Proliferativo': 64,
+    'Proliferativo':    128,
+    'Esclerosado':      192,
+    'Excluido':         255,
 }
 
 LARGE_FILE_THRESHOLD = 300 * 1024 * 1024  # 300 MB
@@ -357,21 +357,15 @@ def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
     # Convert to RGB tuple
     return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
 
-def generate_rgb_mask(
-    binary_mask: np.ndarray,
+def generate_grayscale_mask(
     class_mask: np.ndarray,
-    id_to_rgb: Dict[int, Tuple[int, int, int]],
-    bg_rgb: Tuple[int, int, int]
+    id_to_gray: Dict[int, int]
 ) -> Image.Image:
-    """Generate RGB mask from binary and class masks using precomputed color palette."""
-    rgb_mask = np.zeros((binary_mask.shape[0], binary_mask.shape[1], 3), dtype=np.uint8)
-    rgb_mask[binary_mask == 0] = bg_rgb
-
-    for class_id, rgb in id_to_rgb.items():
-        mask_pixels = class_mask == class_id
-        rgb_mask[mask_pixels] = rgb
-
-    return Image.fromarray(rgb_mask, 'RGB')
+    """Generate grayscale mask: each pixel = gray value of its class (0 = background)."""
+    lut = np.zeros(256, dtype=np.uint8)
+    for class_id, gray_val in id_to_gray.items():
+        lut[class_id] = gray_val
+    return Image.fromarray(lut[class_mask], 'L')
 
 # ============================================================================
 # Tiling and mask generation
@@ -582,7 +576,7 @@ def process_slide_pair(
     pair: Dict,
     output_dir: str,
     class_map: Dict[str, int],
-    class_colors: Dict[str, str],
+    class_gray_values: Dict[str, int],
     tile_size: int = TILE_SIZE,
     zoom_scale: float = ZOOM_SCALE,
     stride: int = STRIDE,
@@ -675,13 +669,12 @@ def process_slide_pair(
         images_dir.mkdir(parents=True, exist_ok=True)
         masks_dir.mkdir(parents=True, exist_ok=True)
 
-        # Precompute color palette once per slide (not per tile)
+        # Precompute grayscale palette once per slide (not per tile)
         id_to_name = {v: k for k, v in class_map.items()}
-        id_to_rgb = {}
-        for class_id, class_name in id_to_name.items():
-            hex_color = class_colors.get(class_name, '#000000')
-            id_to_rgb[class_id] = hex_to_rgb(hex_color)
-        bg_rgb = hex_to_rgb(class_colors.get('background', '#000000'))
+        id_to_gray = {
+            class_id: class_gray_values.get(class_name, 0)
+            for class_id, class_name in id_to_name.items()
+        }
 
         # Build tile registry for metadata
         tile_registry = []
@@ -751,10 +744,10 @@ def process_slide_pair(
             img_path = images_dir / f"{tile_name}.{output_format}"
             (Image.fromarray(np.array(tile_img)) if isinstance(tile_img, np.ndarray) else tile_img).save(str(img_path), output_format.upper(), compress_level=compression)
 
-            # Generate and save RGB-colored mask
-            rgb_mask = generate_rgb_mask(binary_mask, class_mask, id_to_rgb, bg_rgb)
+            # Generate and save grayscale mask
+            gray_mask = generate_grayscale_mask(class_mask, id_to_gray)
             mask_path = masks_dir / f"{tile_name}_mask.png"
-            rgb_mask.save(mask_path, 'PNG', compress_level=compression)
+            gray_mask.save(mask_path, 'PNG', compress_level=compression)
 
             tiles_saved += 1
 
@@ -833,10 +826,10 @@ def process_slide_pair(
             img_path = images_dir / f"{tile_name}.{output_format}"
             (Image.fromarray(np.array(tile_img)) if isinstance(tile_img, np.ndarray) else tile_img).save(str(img_path), output_format.upper(), compress_level=compression)
 
-            # Generate and save RGB-colored mask
-            rgb_mask = generate_rgb_mask(binary_mask, class_mask, id_to_rgb, bg_rgb)
+            # Generate and save grayscale mask
+            gray_mask = generate_grayscale_mask(class_mask, id_to_gray)
             mask_path = masks_dir / f"{tile_name}_mask.png"
-            rgb_mask.save(mask_path, 'PNG', compress_level=compression)
+            gray_mask.save(mask_path, 'PNG', compress_level=compression)
 
             tile_registry.append({
                 'type': 'centered',
@@ -881,7 +874,7 @@ def process_slide_pair(
             'width_native': width,
             'height_native': height,
             'class_map': class_map,
-            'class_colors': class_colors,
+            'class_gray_values': class_gray_values,
             'n_glomeruli': len(glomeruli),
             'n_grid_tiles': len(grid_tiles),
             'n_centered_tiles': len(centered_glom_ids),
@@ -933,7 +926,7 @@ def dynamic_schedule(
     pairs: List[Dict],
     output_dir: str,
     class_map: Dict[str, int],
-    class_colors: Dict[str, str],
+    class_gray_values: Dict[str, int],
     ram_fraction: float = 0.5,
     tile_size: int = TILE_SIZE,
     zoom_scale: float = ZOOM_SCALE,
@@ -972,7 +965,7 @@ def dynamic_schedule(
                     pair,
                     output_dir,
                     class_map,
-                    class_colors,
+                    class_gray_values,
                     tile_size,
                     zoom_scale,
                     stride,
@@ -1020,12 +1013,6 @@ def dynamic_schedule(
 # ============================================================================
 # CLI
 # ============================================================================
-
-def validate_class_colors(class_map: Dict[str, int], class_colors: Dict[str, str]) -> None:
-    """Validate that all classes in class_map have corresponding colors defined."""
-    missing = [name for name in class_map.keys() if name not in class_colors]
-    if missing:
-        raise ValueError(f"Missing colors for classes: {missing}")
 
 def slide_already_processed(stem: str, output_dir: str) -> bool:
     """Check if a slide has been fully processed (marked by _SUCCESS sentinel)."""
@@ -1132,12 +1119,9 @@ def main():
     else:
         logger.info(f"Using class map from config: {class_map}")
 
-    # Load class colors from config for RGB masks
-    class_colors = config.get('class_colors', DEFAULT_CLASS_COLORS)
-    logger.info(f"Using class colors: {class_colors}")
-
-    # Validate that all classes have colors
-    validate_class_colors(class_map, class_colors)
+    # Load class grayscale values for semantic segmentation masks
+    class_gray_values = config.get('class_gray_values', DEFAULT_CLASS_GRAY_VALUES)
+    logger.info(f"Using class gray values: {class_gray_values}")
 
     logger.info(f"Config: tile_size={tile_size}, zoom_scale={zoom_scale}, stride={stride}")
     logger.info(f"Tissue filter: otsu_min_ratio={otsu_min_ratio}, bg_threshold={bg_threshold}, downsample_factor={downsample_factor}")
@@ -1169,7 +1153,7 @@ def main():
         pairs,
         args.output,
         class_map,
-        class_colors,
+        class_gray_values,
         ram_fraction=args.ram_fraction,
         tile_size=tile_size,
         zoom_scale=zoom_scale,

@@ -1,6 +1,6 @@
 tile_size: 1024
 zoom_scale: 0.5
-stride: 512
+stride: 1024
 min_coverage_pct: 60.0
 output_format: png
 compression: 0
@@ -17,9 +17,9 @@ class_map:
   Esclerosado: 3
   Excluido: 4
 
-class_colors:
-  background: "#000000"
-  No_Proliferativo: "#ee8718"
-  Proliferativo: "#00ffff"
-  Esclerosado: "#ff00ff"
-  Excluido: "#00ff00"
+class_gray_values:
+  background: 0
+  No_Proliferativo: 64
+  Proliferativo: 128
+  Esclerosado: 192
+  Excluido: 255
