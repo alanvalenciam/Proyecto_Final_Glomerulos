@@ -8,7 +8,8 @@ from concurrent.futures import ProcessPoolExecutor, as_completed, wait
 from typing import Optional, Tuple
 import os
 
-from PIL import Image
+import numpy as np
+from PIL import Image, ImageDraw
 from tqdm import tqdm
 
 try:
@@ -16,6 +17,50 @@ try:
     HAS_PSUTIL = True
 except ImportError:
     HAS_PSUTIL = False
+
+
+def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
+    """Convert hex color '#RRGGBB' to (R, G, B) tuple."""
+    hex_color = hex_color.lstrip('#')
+    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+
+
+def draw_legend(
+    image: Image.Image,
+    class_map: dict,
+    class_colors: dict,
+    margin: int = 20,
+    box_size: int = 30,
+):
+    """Draw a legend on the image showing class colors and names."""
+    draw = ImageDraw.Draw(image, 'RGBA')
+
+    y = margin
+    x = margin
+
+    # Sort by class ID to ensure consistent order
+    sorted_classes = sorted(class_map.items(), key=lambda item: item[1])
+
+    for class_name, class_id in sorted_classes:
+        if class_name == 'background':
+            continue
+
+        hex_color = class_colors.get(class_name, '#ffffff')
+        r, g, b = hex_to_rgb(hex_color)
+
+        # Draw colored rectangle
+        draw.rectangle(
+            [x, y, x + box_size, y + box_size],
+            fill=(r, g, b, 200)
+        )
+
+        # Draw class name text
+        text = class_name.replace('_', ' ')
+        text_x = x + box_size + 10
+        text_y = y + 5
+        draw.text((text_x, text_y), text, fill='white')
+
+        y += box_size + 8
 
 
 class MemoryMonitor:
@@ -71,8 +116,9 @@ def reconstruct_slide(
     input_dir: Path = Path('Salidas/Tiles_UNet'),
     output_dir: Optional[Path] = None,
     recon_scale: int = 10,
+    overlay_alpha: int = 180,
 ) -> Tuple[bool, str, int]:
-    """Reconstruct a single slide by pasting tiles at their native coordinates."""
+    """Reconstruct a single slide by pasting tiles at their native coordinates with colored overlays."""
     if output_dir is None:
         output_dir = input_dir
 
@@ -92,16 +138,19 @@ def reconstruct_slide(
     native_width = annotations.get('width_native', 0)
     native_height = annotations.get('height_native', 0)
     tiles = annotations.get('tiles', [])
+    class_map = annotations.get('class_map', {})
+    class_colors = annotations.get('class_colors', {})
+    tiling_config = annotations.get('tiling_config', {})
+    zoom_scale = tiling_config.get('zoom_scale', 1.0)
 
     if native_width == 0 or native_height == 0:
         return False, "Invalid native dimensions", 0
 
-    # Skip native allocation — too memory-hungry for gigapixel images
     canvas_width = max(1, native_width // recon_scale)
     canvas_height = max(1, native_height // recon_scale)
 
     wsi_img = Image.new('RGB', (canvas_width, canvas_height), (255, 255, 255))
-    mask_img = Image.new('L', (canvas_width, canvas_height), 0)
+    mask_canvas = Image.new('RGBA', (canvas_width, canvas_height), (0, 0, 0, 0))
 
     for tile_data in tiles:
         image_path = slide_dir / tile_data.get('image', '')
@@ -115,47 +164,74 @@ def reconstruct_slide(
         if image_path.exists():
             try:
                 tile_img = Image.open(image_path).convert('RGB')
-                tile_w_scaled = max(1, tile_img.width // recon_scale)
-                tile_h_scaled = max(1, tile_img.height // recon_scale)
+                # Tiles are at zoom_scale, convert to native pixels then apply recon_scale
+                tile_native_width = int(tile_img.width / zoom_scale)
+                tile_native_height = int(tile_img.height / zoom_scale)
+                tile_w_scaled = max(1, tile_native_width // recon_scale)
+                tile_h_scaled = max(1, tile_native_height // recon_scale)
                 tile_img_scaled = tile_img.resize((tile_w_scaled, tile_h_scaled), Image.LANCZOS)
                 wsi_img.paste(tile_img_scaled, scaled_origin)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"  ⚠️  Warning: Failed to load tile image {image_path}: {e}")
 
         if mask_path.exists():
             try:
-                tile_mask = Image.open(mask_path).convert('L')
-                tile_w_scaled = max(1, tile_mask.width // recon_scale)
-                tile_h_scaled = max(1, tile_mask.height // recon_scale)
+                tile_mask = Image.open(mask_path).convert('RGB')
+                # Tiles are at zoom_scale, convert to native pixels then apply recon_scale
+                tile_native_width = int(tile_mask.width / zoom_scale)
+                tile_native_height = int(tile_mask.height / zoom_scale)
+                tile_w_scaled = max(1, tile_native_width // recon_scale)
+                tile_h_scaled = max(1, tile_native_height // recon_scale)
                 tile_mask_scaled = tile_mask.resize((tile_w_scaled, tile_h_scaled), Image.NEAREST)
-                mask_img.paste(tile_mask_scaled, scaled_origin)
-            except Exception:
-                pass
 
-    # Already downscaled; no need to resize again
+                # Convert to RGBA and make black pixels (background) transparent
+                tile_mask_rgba = tile_mask_scaled.convert('RGBA')
+                mask_arr = np.array(tile_mask_rgba)
+                is_black = (mask_arr[:, :, 0] == 0) & (mask_arr[:, :, 1] == 0) & (mask_arr[:, :, 2] == 0)
+                alpha_arr = np.where(is_black, 0, overlay_alpha)
+                tile_mask_rgba.putalpha(Image.fromarray(alpha_arr.astype(np.uint8)))
+
+                # Create a temporary canvas for this tile at the correct position
+                tile_canvas = Image.new('RGBA', (canvas_width, canvas_height), (0, 0, 0, 0))
+                tile_canvas.paste(tile_mask_rgba, scaled_origin, tile_mask_rgba)
+
+                # Composite tile canvas onto main mask canvas
+                mask_canvas = Image.alpha_composite(mask_canvas, tile_canvas)
+
+            except Exception as e:
+                print(f"  ⚠️  Warning: Failed to load mask {mask_path}: {e}")
+
     wsi_scaled = wsi_img
-    mask_scaled = mask_img
 
     output_recon_dir = output_dir / slide_name / 'reconstructions'
     output_recon_dir.mkdir(parents=True, exist_ok=True)
 
     try:
         recon_path = output_recon_dir / f"{slide_name}_reconstruction.png"
-        mask_path_out = output_recon_dir / f"{slide_name}_mask.png"
+        mask_colored_path = output_recon_dir / f"{slide_name}_mask_colored.png"
         overlay_path = output_recon_dir / f"{slide_name}_overlay.png"
 
         wsi_scaled.save(recon_path, 'PNG')
-        mask_scaled.save(mask_path_out, 'PNG')
 
-        mask_rgb = Image.new('RGB', (canvas_width, canvas_height), (0, 0, 0))
-        mask_rgb.paste((255, 255, 255), (0, 0), mask_scaled)
-        overlay = Image.blend(wsi_scaled, mask_rgb, alpha=0.3)
-        overlay.save(overlay_path, 'PNG')
+        # Save colored mask (RGBA flattened to RGB with black background)
+        mask_rgb_out = mask_canvas.convert('RGB')
+        mask_rgb_out.save(mask_colored_path, 'PNG')
+
+        # Create colored overlay
+        wsi_rgba = wsi_scaled.convert('RGBA')
+        overlay_canvas = Image.alpha_composite(wsi_rgba, mask_canvas)
+        overlay_rgb = overlay_canvas.convert('RGB')
+
+        # Draw legend if we have class info
+        if class_map and class_colors:
+            draw_legend(overlay_rgb, class_map, class_colors)
+
+        overlay_rgb.save(overlay_path, 'PNG')
 
         mem_end = psutil.Process(os.getpid()).memory_info().rss if HAS_PSUTIL else 0
         mem_used = mem_end - mem_start
 
-        return True, f"{slide_name}: 3 outputs saved", mem_used
+        return True, f"{slide_name}: 3 outputs saved (reconstruction + colored_mask + overlay)", mem_used
 
     except Exception as e:
         return False, f"Failed to save outputs: {e}", 0
@@ -166,6 +242,7 @@ def process_all_slides_dynamic(
     output_dir: Path,
     recon_scale: int,
     mem_monitor: MemoryMonitor,
+    overlay_alpha: int = 180,
 ):
     """Process all slides with dynamic worker adaptation."""
     slides = sorted([d.name for d in input_dir.iterdir() if d.is_dir()])
@@ -185,7 +262,7 @@ def process_all_slides_dynamic(
         futures = {}
 
         for slide in slides[:3]:
-            future = executor.submit(reconstruct_slide, slide, input_dir, output_dir, recon_scale)
+            future = executor.submit(reconstruct_slide, slide, input_dir, output_dir, recon_scale, overlay_alpha)
             futures[future] = slide
 
         slide_idx = 3
@@ -211,7 +288,7 @@ def process_all_slides_dynamic(
                     avg_mem = sum(mem_monitor.slide_memory_cache.values()) / len(mem_monitor.slide_memory_cache) if mem_monitor.slide_memory_cache else 500 * 1024**2
                     if mem_monitor.can_load_slide(int(avg_mem)):
                         next_slide = slides[slide_idx]
-                        future = executor.submit(reconstruct_slide, next_slide, input_dir, output_dir, recon_scale)
+                        future = executor.submit(reconstruct_slide, next_slide, input_dir, output_dir, recon_scale, overlay_alpha)
                         futures[future] = next_slide
                         slide_idx += 1
                     else:
@@ -226,6 +303,7 @@ def process_all_slides_fixed(
     output_dir: Path,
     recon_scale: int,
     num_workers: int,
+    overlay_alpha: int = 180,
 ):
     """Process all slides with fixed number of workers."""
     slides = sorted([d.name for d in input_dir.iterdir() if d.is_dir()])
@@ -237,7 +315,7 @@ def process_all_slides_fixed(
 
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = [
-            executor.submit(reconstruct_slide, slide, input_dir, output_dir, recon_scale)
+            executor.submit(reconstruct_slide, slide, input_dir, output_dir, recon_scale, overlay_alpha)
             for slide in slides
         ]
         for future in tqdm(as_completed(futures), total=len(futures), desc="Reconstructing", unit="slide"):
@@ -307,6 +385,12 @@ Examples:
         default=90,
         help='Max %% of system RAM to use in dynamic mode (default: 90)',
     )
+    parser.add_argument(
+        '--overlay-alpha',
+        type=int,
+        default=180,
+        help='Alpha opacity of class colors in overlay (0-255, default: 180)',
+    )
 
     args = parser.parse_args()
 
@@ -314,22 +398,22 @@ Examples:
 
     if args.all or not args.slide_name:
         if args.workers is not None:
-            process_all_slides_fixed(args.input_dir, output_dir, args.scale, args.workers)
+            process_all_slides_fixed(args.input_dir, output_dir, args.scale, args.workers, args.overlay_alpha)
         else:
             if not HAS_PSUTIL:
                 print("⚠️  psutil not installed. Installing it would enable dynamic memory monitoring.")
                 print("   Falling back to fixed 2 workers.")
-                process_all_slides_fixed(args.input_dir, output_dir, args.scale, 2)
+                process_all_slides_fixed(args.input_dir, output_dir, args.scale, 2, args.overlay_alpha)
             else:
                 mem_monitor = MemoryMonitor(args.mem_percent)
-                process_all_slides_dynamic(args.input_dir, output_dir, args.scale, mem_monitor)
+                process_all_slides_dynamic(args.input_dir, output_dir, args.scale, mem_monitor, args.overlay_alpha)
     else:
         if not args.slide_name:
             parser.print_help()
             return
 
         print(f"Reconstructing {args.slide_name}...")
-        success, message, mem_used = reconstruct_slide(args.slide_name, args.input_dir, output_dir, args.scale)
+        success, message, mem_used = reconstruct_slide(args.slide_name, args.input_dir, output_dir, args.scale, args.overlay_alpha)
         if success:
             print(f"  ✓ {message}")
         else:
