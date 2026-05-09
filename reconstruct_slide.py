@@ -30,37 +30,53 @@ def draw_legend(
     class_map: dict,
     class_colors: dict,
     margin: int = 20,
-    box_size: int = 30,
+    box_size: int = 40,
 ):
     """Draw a legend on the image showing class colors and names."""
     draw = ImageDraw.Draw(image, 'RGBA')
 
-    y = margin
-    x = margin
-
     # Sort by class ID to ensure consistent order
     sorted_classes = sorted(class_map.items(), key=lambda item: item[1])
+    non_bg_classes = [c for c in sorted_classes if c[0] != 'background']
 
-    for class_name, class_id in sorted_classes:
-        if class_name == 'background':
-            continue
+    if not non_bg_classes:
+        return
 
+    # Calculate legend dimensions
+    legend_width = 320
+    legend_height = margin + (len(non_bg_classes) * (box_size + 12)) + margin
+
+    # Draw semi-transparent black background for legend
+    draw.rectangle(
+        [margin - 5, margin - 5, margin + legend_width, margin + legend_height],
+        fill=(0, 0, 0, 220)
+    )
+
+    y = margin
+    x = margin + 10
+
+    for class_name, class_id in non_bg_classes:
         hex_color = class_colors.get(class_name, '#ffffff')
         r, g, b = hex_to_rgb(hex_color)
 
         # Draw colored rectangle
         draw.rectangle(
             [x, y, x + box_size, y + box_size],
-            fill=(r, g, b, 200)
+            fill=(r, g, b, 255),
+            outline='white'
         )
 
-        # Draw class name text
+        # Draw class name text - larger and bold
         text = class_name.replace('_', ' ')
-        text_x = x + box_size + 10
-        text_y = y + 5
+        text_x = x + box_size + 15
+        text_y = y + 8
+
+        # Draw text with black outline for visibility
+        for adj_x, adj_y in [(-1, -1), (-1, 1), (1, -1), (1, 1), (0, -1), (0, 1), (-1, 0), (1, 0)]:
+            draw.text((text_x + adj_x, text_y + adj_y), text, fill='black')
         draw.text((text_x, text_y), text, fill='white')
 
-        y += box_size + 8
+        y += box_size + 12
 
 
 class MemoryMonitor:
@@ -98,7 +114,7 @@ class MemoryMonitor:
         available = self.get_available_memory()
         avg_slide_memory = sum(self.slide_memory_cache.values()) / len(self.slide_memory_cache) if self.slide_memory_cache else 500 * 1024**2
         max_workers = max(1, (self.max_allowed // int(avg_slide_memory)))
-        return min(max(1, available // (avg_slide_memory * 1.2)), max_workers)
+        return int(min(max(1, available // int(avg_slide_memory * 1.2)), max_workers))
 
     def report_slide_memory(self, slide_name: str, memory_used: int):
         """Cache memory usage of a slide for future estimates."""
@@ -257,7 +273,7 @@ def process_all_slides_dynamic(
     failed = 0
     pbar = tqdm(total=len(slides), desc="Reconstructing", unit="slide")
 
-    max_workers = min(8, mem_monitor.get_recommended_workers() * 2)
+    max_workers = int(min(8, mem_monitor.get_recommended_workers() * 2))
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {}
 
