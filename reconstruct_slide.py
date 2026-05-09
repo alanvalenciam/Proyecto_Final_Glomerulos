@@ -187,7 +187,7 @@ def reconstruct_slide(
                     (w_s, h_s), Image.LANCZOS
                 )
                 wsi_img.paste(tile_img_scaled, scaled_origin)
-            except (IOError, OSError) as e:
+            except (IOError, OSError, ValueError) as e:
                 msg = f"  ⚠️  Warning: Failed to load image {image_path}: {e}"
                 print(msg)
 
@@ -202,7 +202,7 @@ def reconstruct_slide(
                 )
                 mask_canvas.paste(tile_mask_scaled, scaled_origin)
 
-            except (IOError, OSError) as e:
+            except (IOError, OSError, ValueError) as e:
                 msg = f"  ⚠️  Warning: Failed to load mask {mask_path}: {e}"
                 print(msg)
 
