@@ -471,8 +471,8 @@ Examples:
     parser.add_argument(
         '--mem-percent',
         type=int,
-        default=90,
-        help='Max %% of system RAM to use in dynamic mode (default: 90)',
+        default=50,
+        help='Max %% of system RAM to use in dynamic mode (default: 50)',
     )
     parser.add_argument(
         '--overlay-alpha',
