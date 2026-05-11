@@ -14,3 +14,4 @@ AGENTS.md
 .DS_Store
 /.atl
 /checkpoints
+/checkpointsd
