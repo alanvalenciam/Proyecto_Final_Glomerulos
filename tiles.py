@@ -29,9 +29,18 @@ except ImportError:
     OPENCV_AVAILABLE = False
     logger.warning("opencv-python not installed. Install with: pip install opencv-python. Otsu-based tissue masking will be disabled.")
 
+try:
+    import tifffile
+    TIFFFILE_AVAILABLE = True
+except ImportError:
+    TIFFFILE_AVAILABLE = False
+    logger.warning("tifffile not installed. Large TIFFs will fall back to PIL. Install: pip install tifffile")
+
 OPENSLIDE_FORMATS = {'.svs', '.ndpi', '.vms'}
 PIL_FORMATS = {'.tif', '.tiff', '.png', '.jpg', '.jpeg'}
 ALL_FORMATS = OPENSLIDE_FORMATS | PIL_FORMATS
+
+LARGE_FILE_THRESHOLD = 300 * 1024 * 1024  # 300 MB — route large TIFFs away from PIL
 
 
 def _safe_worker_count(image_paths):
@@ -70,11 +79,30 @@ def _safe_worker_count(image_paths):
 
 
 def detect_format(file_path):
-    """Detect image format by file extension."""
+    """Detect image format by file extension and size. Routes large TIFFs to OpenSlide or tifffile."""
     ext = os.path.splitext(file_path)[1].lower()
-    if ext in OPENSLIDE_FORMATS:
+    size = os.path.getsize(file_path)
+
+    # For TIFF files, route by size and backend availability
+    if ext in {'.tif', '.tiff'}:
+        if OPENSLIDE_AVAILABLE and size > LARGE_FILE_THRESHOLD:
+            return 'openslide'
+        if size < LARGE_FILE_THRESHOLD:
+            return 'pil'
+        if not OPENSLIDE_AVAILABLE and size > LARGE_FILE_THRESHOLD:
+            if TIFFFILE_AVAILABLE:
+                logger.info(f"Large TIFF ({size / 1e9:.1f} GB) without OpenSlide — using tifffile memmap")
+                return 'tifffile'
+            else:
+                logger.warning("Large TIFF without OpenSlide or tifffile — attempting PIL (may OOM)")
+                return 'pil'
+        return 'pil'
+
+    # OpenSlide formats
+    if ext in OPENSLIDE_FORMATS and OPENSLIDE_AVAILABLE:
         return 'openslide'
-    elif ext in PIL_FORMATS:
+    # Regular image formats
+    if ext in {'.png', '.jpg', '.jpeg'}:
         return 'pil'
     return None
 
@@ -87,9 +115,16 @@ def generate_otsu_mask(img_or_slide, downsample_factor=20):
     if hasattr(img_or_slide, 'get_thumbnail'):  # OpenSlide
         w, h = img_or_slide.level_dimensions[0]
         thumb = img_or_slide.get_thumbnail((w // downsample_factor, h // downsample_factor))
+    elif isinstance(img_or_slide, np.ndarray):  # tifffile memmap
+        logger.info("Otsu mask skipped for tifffile/numpy input — using per-tile background filter only")
+        return None, None
     else:  # PIL Image
         w, h = img_or_slide.size
-        thumb = img_or_slide.resize((w // downsample_factor, h // downsample_factor), Image.Resampling.LANCZOS)
+        try:
+            thumb = img_or_slide.resize((w // downsample_factor, h // downsample_factor), Image.Resampling.LANCZOS)
+        except MemoryError:
+            logger.warning("MemoryError generating Otsu mask — skipping (per-tile filter still active)")
+            return None, None
 
     thumb_cv = cv2.cvtColor(np.array(thumb.convert('RGB')), cv2.COLOR_RGB2HSV)
     saturation = cv2.medianBlur(thumb_cv[:, :, 1], 7)
@@ -152,6 +187,32 @@ def save_tile(tile, tile_path, output_format='png'):
             raise
 
 
+def extract_tile_tifffile(slide, x, y, size):
+    """Extract tile from tifffile memmap — reads only the requested region."""
+    h, w = slide.shape[:2]
+    x_start = max(0, min(x, w - 1))
+    y_start = max(0, min(y, h - 1))
+    x_end = min(x + size, w)
+    y_end = min(y + size, h)
+    region = slide[y_start:y_end, x_start:x_end]
+
+    if len(region.shape) == 2:
+        tile = Image.fromarray(region, mode='L').convert('RGB')
+    elif len(region.shape) == 3 and region.shape[2] == 3:
+        tile = Image.fromarray(region, mode='RGB')
+    elif len(region.shape) == 3 and region.shape[2] == 4:
+        tile = Image.fromarray(region, mode='RGBA').convert('RGB')
+    else:
+        tile = Image.new('RGB', (size, size), (255, 255, 255))
+        return tile
+
+    if tile.size != (size, size):
+        padded = Image.new('RGB', (size, size), (255, 255, 255))
+        padded.paste(tile, (0, 0))
+        tile = padded
+    return tile
+
+
 def _process_single_image(args):
     """
     Process a single image to tiles. Worker function for multiprocessing.
@@ -190,29 +251,16 @@ def _process_single_image(args):
             level_count = slide.level_count
             logger.info(f"  Dimensions (level 0): {native_width}x{native_height}")
             logger.info(f"  Resolution levels: {level_count}")
-
-            # Get native MPP and compute downsampling
-            try:
-                native_mpp = float(slide.properties.get('openslide.mpp-x', 0))
-                if native_mpp > 0 and target_mpp > 0:
-                    downsample_ratio = target_mpp / native_mpp
-                    logger.info(f"  Native MPP: {native_mpp:.4f} µm/px")
-                    logger.info(f"  Downsampling ratio: {downsample_ratio:.4f}")
-                else:
-                    raise ValueError("Invalid MPP values")
-            except (ValueError, TypeError, AttributeError):
-                logger.warning("Could not determine native MPP, using full resolution")
-                native_mpp = None
-                downsample_ratio = 1.0
+            logger.info(f"  Tiling with zoom_scale={zoom_scale} (native capture × {1/zoom_scale:.1f})")
 
             # Generate Otsu mask
             if OPENCV_AVAILABLE:
                 mask, downsample_factor = generate_otsu_mask(slide, downsample_factor=20)
                 logger.info(f"  Otsu mask generated (downsample × {downsample_factor})")
 
-            # Compute iteration parameters in native space
-            native_tile_size = int(tile_size * downsample_ratio)
-            native_stride = int((tile_size - overlap) * downsample_ratio)
+            # Compute iteration parameters in native space using zoom_scale
+            native_tile_size = int(tile_size / zoom_scale)
+            native_stride = int((tile_size - overlap) / zoom_scale)
 
             saved_count = 0
             skipped_count = 0
@@ -268,11 +316,9 @@ def _process_single_image(args):
 
             # Save metadata
             metadata = {
-                "native_mpp": native_mpp,
-                "target_mpp": target_mpp,
-                "downsample_ratio": downsample_ratio,
                 "tile_size": tile_size,
                 "overlap": overlap,
+                "zoom_scale": zoom_scale,
                 "native_width": native_width,
                 "native_height": native_height,
                 "format": "openslide"
@@ -360,6 +406,62 @@ def _process_single_image(args):
                 "native_width": native_width,
                 "native_height": native_height,
                 "format": "pil",
+                "zoom_scale": zoom_scale
+            }
+
+        elif handler == 'tifffile':
+            slide = tifffile.memmap(image_path)
+            h, w = slide.shape[:2]
+            native_width, native_height = w, h
+            logger.info(f"  Dimensions: {native_width}x{native_height} (tifffile memmap)")
+
+            native_mpp = None
+            downsample_ratio = zoom_scale
+            logger.info(f"  Tiling with zoom_scale={zoom_scale} (native capture × {1/zoom_scale:.1f})")
+
+            # Otsu mask not supported for memmap — per-tile bg filter still active
+            mask, downsample_factor = None, None
+
+            native_tile_size = int(tile_size / zoom_scale)
+            native_stride = int((tile_size - overlap) / zoom_scale)
+            saved_count = 0
+            skipped_count = 0
+
+            for y in range(0, native_height, native_stride):
+                for x in range(0, native_width, native_stride):
+                    x_end = min(x + native_tile_size, native_width)
+                    y_end = min(y + native_tile_size, native_height)
+
+                    tile = extract_tile_tifffile(slide, x, y, native_tile_size)
+
+                    if tile.size != (tile_size, tile_size):
+                        tile = tile.resize((tile_size, tile_size), Image.Resampling.LANCZOS)
+
+                    if is_mostly_background(tile, bg_threshold):
+                        skipped_count += 1
+                        continue
+
+                    ext = '.' + output_format.lstrip('.')
+                    tile_name = f"{base_name}_tile_x{x:05d}_y{y:05d}_endx{x_end:05d}_endy{y_end:05d}{ext}"
+                    tile_path = os.path.join(image_output_dir, tile_name)
+
+                    save_tile(tile, tile_path, output_format)
+                    saved_count += 1
+
+                    if saved_count % 100 == 0:
+                        logger.info(f"  Saved {saved_count} tiles...")
+
+            logger.info(f"  Final: {saved_count} tiles saved, {skipped_count} background tiles skipped")
+
+            metadata = {
+                "native_mpp": None,
+                "target_mpp": None,
+                "downsample_ratio": zoom_scale,
+                "tile_size": tile_size,
+                "overlap": overlap,
+                "native_width": native_width,
+                "native_height": native_height,
+                "format": "tifffile",
                 "zoom_scale": zoom_scale
             }
 
@@ -457,14 +559,14 @@ def process_folder_to_subfolders(input_dir, output_dir, tile_size=1024, overlap=
 
 
 if __name__ == "__main__":
-    input_dir = r"/Users/olivera/Documents/Proyecto_Final_Glomerulos/Entradas"
-    output_dir = r"/Users/olivera/Documents/Proyecto_Final_Glomerulos/Salidas"
+    input_dir = r"./Entradas"
+    output_dir = r"./Salidas"
 
     process_folder_to_subfolders(
         input_dir,
         output_dir,
         tile_size=1024,
-        overlap=512,           # 25% overlap for better tissue coverage
+        overlap=256,           # 25% overlap for better tissue coverage
         target_mpp=0.5,        # Standard resolution for OpenSlide (20x equivalent)
         zoom_scale=0.5,        # Downsampling for PIL (TIFF) — captures 4x more native pixels
         bg_threshold=15.0,     # Less aggressive filter for low-quality staining
