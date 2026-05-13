@@ -5,6 +5,14 @@ min_coverage_pct: 60.0
 output_format: png
 compression: 0
 
+# Manifest build options
+force_rebuild_manifest: false
+  # Set to true to rebuild the manifest from annotations.json (ignores cache)
+classifier_input_size: 512
+  # Target size for resized glomerulus crops
+manifest_primary_only: true
+  # Set to false to include glomeruli without a primary centered tile
+
 tissue_filter:
   otsu_min_ratio: 0.01
   bg_threshold: 15.0
