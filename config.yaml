@@ -6,7 +6,7 @@ output_format: png
 compression: 0
 
 # Manifest build options
-force_rebuild_manifest: true
+force_rebuild_manifest: false
   # Set to true to rebuild the manifest from annotations.json (ignores cache)
 classifier_input_size: 224
   # Target size for resized glomerulus crops (224 is optimal for EfficientNet-B0 and ResNet-50)
