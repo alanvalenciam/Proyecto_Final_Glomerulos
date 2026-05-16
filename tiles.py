@@ -1,11 +1,12 @@
 import os
 import json
 import logging
-from PIL import Image
+from PIL import Image, ImageDraw
 import numpy as np
 from pathlib import Path
 from multiprocessing import Pool, cpu_count
 import time
+from typing import List, Dict, Tuple, Optional
 
 Image.MAX_IMAGE_PIXELS = None
 
@@ -161,6 +162,240 @@ def is_mostly_background(tile, min_std=15.0):
     return float(np.std(gray)) < min_std
 
 
+def load_geojson_annotations(slide_name: str, annotations_dir: str) -> Optional[List[Dict]]:
+    """
+    Load GeoJSON annotations for a slide.
+
+    Args:
+        slide_name: Biopsy/slide identifier (e.g., '18-139')
+        annotations_dir: Path to directory containing GeoJSON files
+
+    Returns:
+        List of annotation dicts with keys: gid, class, color, polygon
+        or None if no file found
+    """
+    annotations_dir = Path(annotations_dir)
+    if not annotations_dir.exists():
+        return None
+
+    geojson_path = annotations_dir / f"{slide_name}.geojson"
+    if not geojson_path.exists():
+        candidates = list(annotations_dir.glob(f"*{slide_name}*.geojson"))
+        if candidates:
+            geojson_path = candidates[0]
+        else:
+            return None
+
+    try:
+        with open(geojson_path, 'r') as f:
+            geojson = json.load(f)
+    except (json.JSONDecodeError, IOError) as e:
+        logger.warning(f"Failed to load annotations from {geojson_path}: {e}")
+        return None
+
+    annotations = []
+    features = geojson.get('features', [])
+
+    for gid, feature in enumerate(features):
+        geom = feature.get('geometry', {})
+        props = feature.get('properties', {})
+
+        if geom.get('type') != 'Polygon':
+            continue
+
+        coords = geom.get('coordinates', [[]])
+        if not coords or not coords[0]:
+            continue
+
+        class_name = props.get('classification', {}).get('name', 'unknown')
+        color = props.get('classification', {}).get('color', [0, 0, 0])
+
+        annotations.append({
+            'gid': gid,
+            'class': class_name,
+            'color': color,
+            'polygon': coords[0],  # Exterior ring only
+        })
+
+    return annotations if annotations else None
+
+
+def polygon_intersects_tile(polygon: List[Tuple], tile_x: int, tile_y: int, tile_size: int) -> bool:
+    """Check if a polygon intersects with a tile's bounding box (all in native coords)."""
+    xs = [p[0] for p in polygon]
+    ys = [p[1] for p in polygon]
+    poly_minx, poly_miny = min(xs), min(ys)
+    poly_maxx, poly_maxy = max(xs), max(ys)
+
+    tile_minx, tile_miny = tile_x, tile_y
+    tile_maxx, tile_maxy = tile_x + tile_size, tile_y + tile_size
+
+    return not (poly_maxx < tile_minx or poly_minx > tile_maxx or
+                poly_maxy < tile_miny or poly_miny > tile_maxy)
+
+
+def class_name_to_gray_value(class_name: str) -> int:
+    """Map glomerulus class name to grayscale value.
+
+    Values from config.yaml:
+    - background: 0
+    - No_Proliferativo: 64
+    - Proliferativo: 128
+    - Esclerosado: 192
+    - Excluido: 255
+    """
+    class_map = {
+        'no prolif': 64,           # GeoJSON often uses lowercase/abbreviated
+        'No_Proliferativo': 64,
+        'prolif': 128,
+        'Proliferativo': 128,
+        'esclerosado': 192,
+        'Esclerosado': 192,
+        'exclude': 255,
+        'Excluido': 255,
+        'excluded': 255,
+    }
+    # Case-insensitive lookup
+    for key, value in class_map.items():
+        if key.lower() == class_name.lower():
+            return value
+    # Default to 64 (No_Proliferativo) if not found
+    logger.debug(f"Unknown class '{class_name}', defaulting to 64 (No_Proliferativo)")
+    return 64
+
+
+def rasterize_polygon_to_mask(polygon: List[Tuple], tile_x: int, tile_y: int,
+                              native_tile_size: int, output_tile_size: int,
+                              zoom_scale: float, gray_value: int = 255) -> np.ndarray:
+    """
+    Rasterize a single polygon to a mask at native resolution, then resize.
+
+    Args:
+        polygon: List of (x, y) tuples in native slide coordinates
+        tile_x, tile_y: Native tile top-left corner
+        native_tile_size: Tile size in native coordinates
+        output_tile_size: Output tile size (e.g., 1024)
+        zoom_scale: Downsampling factor (e.g., 0.5)
+        gray_value: Grayscale value to fill polygon (0-255)
+
+    Returns:
+        Numpy array (output_tile_size × output_tile_size, dtype uint8, 0 or gray_value)
+    """
+    mask = Image.new('L', (native_tile_size, native_tile_size), 0)
+    draw = ImageDraw.Draw(mask)
+
+    polygon_relative = [(p[0] - tile_x, p[1] - tile_y) for p in polygon]
+
+    clipped_polygon = []
+    for x, y in polygon_relative:
+        x = max(0, min(x, native_tile_size))
+        y = max(0, min(y, native_tile_size))
+        clipped_polygon.append((x, y))
+
+    if len(clipped_polygon) >= 3:
+        try:
+            draw.polygon(clipped_polygon, fill=gray_value)
+        except Exception as e:
+            logger.debug(f"Failed to rasterize polygon: {e}")
+
+    mask_array = np.array(mask, dtype=np.uint8)
+
+    if output_tile_size != native_tile_size:
+        scale_factor = output_tile_size / native_tile_size
+        mask_pil = Image.fromarray(mask_array, mode='L')
+        new_size = (output_tile_size, output_tile_size)
+        mask_pil = mask_pil.resize(new_size, Image.Resampling.NEAREST)
+        mask_array = np.array(mask_pil, dtype=np.uint8)
+
+    return mask_array
+
+
+def rasterize_annotations_to_tile_mask(
+    annotations: List[Dict], tile_x: int, tile_y: int,
+    tile_size: int, native_tile_size: int, zoom_scale: float
+) -> Tuple[Image.Image, List[int]]:
+    """
+    Rasterize all annotations intersecting a tile to a single mask image.
+    Uses grayscale values from class_name_to_gray_value() to encode class information.
+
+    Args:
+        annotations: List of annotation dicts (from load_geojson_annotations)
+        tile_x, tile_y: Native tile top-left corner
+        tile_size: Output tile size (e.g., 1024)
+        native_tile_size: Tile size in native coordinates
+        zoom_scale: Downsampling factor
+
+    Returns:
+        (PIL Image 'L' grayscale with class values, list of GIDs present in tile)
+    """
+    if not annotations:
+        return Image.new('L', (tile_size, tile_size), 0), []
+
+    # Start with output size mask (already resized)
+    combined_mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
+    tile_gids = []
+
+    for ann in annotations:
+        if not polygon_intersects_tile(ann['polygon'], tile_x, tile_y, native_tile_size):
+            continue
+
+        # Get grayscale value for this glomerulus class
+        gray_value = class_name_to_gray_value(ann['class'])
+
+        poly_mask = rasterize_polygon_to_mask(
+            ann['polygon'], tile_x, tile_y,
+            native_tile_size, tile_size, zoom_scale,
+            gray_value=gray_value  # Pass class-specific gray value
+        )
+        # poly_mask is already (tile_size, tile_size), so no reshape needed
+        # Use maximum to preserve highest class value if polygons overlap
+        combined_mask = np.maximum(combined_mask, poly_mask)
+        tile_gids.append(ann['gid'])
+
+    return Image.fromarray(combined_mask, mode='L'), tile_gids
+
+
+def build_glomerulus_tile_index(
+    annotations: List[Dict], tile_records: List[Dict]
+) -> Dict:
+    """
+    Build index mapping glomeruli to their containing tiles.
+
+    Args:
+        annotations: List of annotation dicts
+        tile_records: List of dicts with keys 'tile' (filename), 'gids' (list of GIDs)
+
+    Returns:
+        Dict with 'glomeruli' and 'tile_to_glomeruli' keys
+    """
+    tile_to_glomeruli = {}
+    glomeruli_tiles = {}
+
+    for record in tile_records:
+        tile_name = record['tile']
+        gids = record['gids']
+        if gids:
+            tile_to_glomeruli[tile_name] = gids
+            for gid in gids:
+                glomeruli_tiles.setdefault(gid, []).append(tile_name)
+
+    glomeruli_list = []
+    for ann in annotations:
+        gid = ann['gid']
+        tiles = glomeruli_tiles.get(gid, [])
+        glomeruli_list.append({
+            'gid': gid,
+            'class': ann['class'],
+            'color': ann['color'],
+            'tiles': tiles,
+        })
+
+    return {
+        'glomeruli': glomeruli_list,
+        'tile_to_glomeruli': tile_to_glomeruli,
+    }
+
+
 def save_tile(tile, tile_path, output_format='png'):
     """Save tile in specified format."""
     output_format = output_format.lower().strip('.')
@@ -220,24 +455,37 @@ def _process_single_image(args):
     Args:
         args: Tuple of (file_name, input_dir, output_dir, tile_size, overlap,
                         target_mpp, zoom_scale, bg_threshold, output_format,
-                        openslide_level, otsu_min_ratio)
+                        openslide_level, otsu_min_ratio, annotations_dir)
 
     Returns:
         str: base_name if successful, None if failed.
     """
     (file_name, input_dir, output_dir, tile_size, overlap, target_mpp,
-     zoom_scale, bg_threshold, output_format, openslide_level, otsu_min_ratio) = args
+     zoom_scale, bg_threshold, output_format, openslide_level, otsu_min_ratio,
+     annotations_dir) = args
 
     image_path = os.path.join(input_dir, file_name)
     base_name = os.path.splitext(file_name)[0]
     file_ext = os.path.splitext(file_name)[1].lower()
 
-    image_output_dir = os.path.join(output_dir, "Imagen", base_name)
+    slide_output_dir = os.path.join(output_dir, "Imagen", base_name)
+    image_output_dir = os.path.join(slide_output_dir, "images")
+    mask_output_dir = os.path.join(slide_output_dir, "masks") if annotations_dir else None
+
     Path(image_output_dir).mkdir(parents=True, exist_ok=True)
+    if mask_output_dir:
+        Path(mask_output_dir).mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Processing: {file_name}")
     logger.info(f"  Type: {file_ext[1:].upper()}")
     logger.info(f"  Output dir: {image_output_dir}")
+
+    annotations = None
+    tile_records = []
+    if annotations_dir:
+        annotations = load_geojson_annotations(base_name, annotations_dir)
+        if annotations:
+            logger.info(f"  Loaded {len(annotations)} annotations from GeoJSON")
 
     try:
         handler = detect_format(image_path)
@@ -307,6 +555,17 @@ def _process_single_image(args):
                         tile = padded_tile
 
                     save_tile(tile, tile_path, output_format)
+
+                    # Save mask if annotations available
+                    if annotations:
+                        mask_img, tile_gids = rasterize_annotations_to_tile_mask(
+                            annotations, native_x, native_y,
+                            tile_size, native_tile_size, zoom_scale
+                        )
+                        mask_path = os.path.join(mask_output_dir, tile_name.replace(ext, '_mask.png'))
+                        mask_img.save(mask_path, 'PNG')
+                        tile_records.append({'tile': tile_name, 'gids': tile_gids})
+
                     saved_count += 1
 
                     if saved_count % 100 == 0:
@@ -321,7 +580,9 @@ def _process_single_image(args):
                 "zoom_scale": zoom_scale,
                 "native_width": native_width,
                 "native_height": native_height,
-                "format": "openslide"
+                "format": "openslide",
+                "has_annotations": annotations is not None,
+                "glomerulus_count": len(annotations) if annotations else 0
             }
 
         elif handler == 'pil':
@@ -389,6 +650,17 @@ def _process_single_image(args):
                         tile = padded_tile
 
                     save_tile(tile, tile_path, output_format)
+
+                    # Save mask if annotations available
+                    if annotations:
+                        mask_img, tile_gids = rasterize_annotations_to_tile_mask(
+                            annotations, x, y,
+                            tile_size, native_tile_size, zoom_scale
+                        )
+                        mask_path = os.path.join(mask_output_dir, tile_name.replace(ext, '_mask.png'))
+                        mask_img.save(mask_path, 'PNG')
+                        tile_records.append({'tile': tile_name, 'gids': tile_gids})
+
                     saved_count += 1
 
                     if saved_count % 100 == 0:
@@ -406,7 +678,9 @@ def _process_single_image(args):
                 "native_width": native_width,
                 "native_height": native_height,
                 "format": "pil",
-                "zoom_scale": zoom_scale
+                "zoom_scale": zoom_scale,
+                "has_annotations": annotations is not None,
+                "glomerulus_count": len(annotations) if annotations else 0
             }
 
         elif handler == 'tifffile':
@@ -446,6 +720,17 @@ def _process_single_image(args):
                     tile_path = os.path.join(image_output_dir, tile_name)
 
                     save_tile(tile, tile_path, output_format)
+
+                    # Save mask if annotations available
+                    if annotations:
+                        mask_img, tile_gids = rasterize_annotations_to_tile_mask(
+                            annotations, x, y,
+                            tile_size, native_tile_size, zoom_scale
+                        )
+                        mask_path = os.path.join(mask_output_dir, tile_name.replace(ext, '_mask.png'))
+                        mask_img.save(mask_path, 'PNG')
+                        tile_records.append({'tile': tile_name, 'gids': tile_gids})
+
                     saved_count += 1
 
                     if saved_count % 100 == 0:
@@ -462,17 +747,27 @@ def _process_single_image(args):
                 "native_width": native_width,
                 "native_height": native_height,
                 "format": "tifffile",
-                "zoom_scale": zoom_scale
+                "zoom_scale": zoom_scale,
+                "has_annotations": annotations is not None,
+                "glomerulus_count": len(annotations) if annotations else 0
             }
 
         else:
             raise ValueError(f"Unsupported format: {file_ext}")
 
         # Save metadata.json
-        metadata_path = os.path.join(image_output_dir, "metadata.json")
+        metadata_path = os.path.join(slide_output_dir, "metadata.json")
         with open(metadata_path, 'w') as f:
             json.dump(metadata, f, indent=2)
         logger.info(f"  Metadata saved to metadata.json")
+
+        # Save glomerulus index if annotations were processed
+        if annotations and tile_records:
+            index = build_glomerulus_tile_index(annotations, tile_records)
+            index_path = os.path.join(slide_output_dir, "glomerulus_index.json")
+            with open(index_path, 'w') as f:
+                json.dump(index, f, indent=2)
+            logger.info(f"  Glomerulus index saved ({len(annotations)} glomeruli, {len(set(r['tile'] for r in tile_records))} tiles with annotations)")
 
         return base_name
 
@@ -483,7 +778,8 @@ def _process_single_image(args):
 
 def process_folder_to_subfolders(input_dir, output_dir, tile_size=1024, overlap=512,
                                 target_mpp=0.5, zoom_scale=0.5, bg_threshold=15.0, output_format='png',
-                                openslide_level=0, format_filter=None, otsu_min_ratio=0.01, num_workers=None):
+                                openslide_level=0, format_filter=None, otsu_min_ratio=0.01, num_workers=None,
+                                annotations_dir=None):
     """
     Process histopathology images into tiles using MPP-aware resolution with parallel processing.
 
@@ -501,6 +797,7 @@ def process_folder_to_subfolders(input_dir, output_dir, tile_size=1024, overlap=
         otsu_min_ratio: Minimum tissue ratio in Otsu mask (default 0.01 = 1%).
                        Use 0.01-0.02 for normal quality, 0.005-0.01 for low-quality staining.
         num_workers: Number of parallel workers (None = auto-calculate based on RAM)
+        annotations_dir: Directory containing GeoJSON annotation files (optional, enables mask export)
     """
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -539,7 +836,7 @@ def process_folder_to_subfolders(input_dir, output_dir, tile_size=1024, overlap=
     tasks = [
         (file_name, input_dir, output_dir, tile_size, overlap,
          target_mpp, zoom_scale, bg_threshold, output_format,
-         openslide_level, otsu_min_ratio)
+         openslide_level, otsu_min_ratio, annotations_dir)
         for file_name in imagenes_a_procesar
     ]
 
@@ -559,8 +856,48 @@ def process_folder_to_subfolders(input_dir, output_dir, tile_size=1024, overlap=
 
 
 if __name__ == "__main__":
+    import sys
+
     input_dir = r"./Entradas"
     output_dir = r"./Salidas"
+    annotations_dir = r"./Entradas"  # Set to None to disable mask export
+    split_json = r"./Salidas/biopsy_split.json"
+
+    # Load test set from shared split
+    test_biopsies = None
+    if Path(split_json).exists():
+        try:
+            with open(split_json, 'r') as f:
+                split_data = json.load(f)
+                test_biopsies = set(split_data.get('test', []))
+                logger.info(f"Loaded test set from {split_json}: {len(test_biopsies)} biopsies")
+                logger.info(f"Test biopsies: {sorted(test_biopsies)}")
+        except Exception as e:
+            logger.warning(f"Could not load split from {split_json}: {e}")
+    else:
+        logger.warning(f"Split file not found at {split_json}")
+        logger.warning("Will process ALL images. Provide a valid split JSON to process only test set.")
+
+    # Filter input directory to only include test biopsies
+    if test_biopsies:
+        # Create temporary directory with only test images
+        temp_dir = Path(output_dir) / "_temp_test_input"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        input_path = Path(input_dir)
+        processed_count = 0
+
+        for item in input_path.iterdir():
+            if item.is_file() and item.suffix.lower() in {'.svs', '.ndpi', '.vms', '.tif', '.tiff', '.png', '.jpg', '.jpeg'}:
+                biopsy_name = item.stem
+                if biopsy_name in test_biopsies:
+                    import shutil
+                    shutil.copy2(item, temp_dir / item.name)
+                    processed_count += 1
+                    logger.info(f"Copied {item.name} to temp directory")
+
+        logger.info(f"Filtered input: {processed_count} test images in {temp_dir}")
+        input_dir = str(temp_dir)
 
     process_folder_to_subfolders(
         input_dir,
@@ -572,5 +909,15 @@ if __name__ == "__main__":
         bg_threshold=15.0,     # Less aggressive filter for low-quality staining
         output_format='png',
         openslide_level=0,
-        otsu_min_ratio=0.01    # 1% minimum tissue (permissive for weak staining)
+        otsu_min_ratio=0.01,   # 1% minimum tissue (permissive for weak staining)
+        annotations_dir=annotations_dir  # Enable mask export from GeoJSON
     )
+
+    # Clean up temp directory
+    if test_biopsies:
+        import shutil
+        try:
+            shutil.rmtree(temp_dir)
+            logger.info(f"Cleaned up temporary directory: {temp_dir}")
+        except Exception as e:
+            logger.warning(f"Could not clean up temp directory: {e}")
