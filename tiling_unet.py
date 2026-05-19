@@ -16,9 +16,6 @@ import psutil
 
 # Increase PIL's limit for PNG chunk decompression (default 128 KB → 10 MB)
 Image.MAX_IMAGE_PIXELS = None
-Image.Resampling = Image.Resampling if hasattr(Image, 'Resampling') else Image
-import PIL
-PIL.Image.MAX_TEXT_CHUNK = 10 * 1024 * 1024  # 10 MB
 
 try:
     import openslide
@@ -47,11 +44,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-Image.MAX_IMAGE_PIXELS = None
-
 # Configuration
 TILE_SIZE = 1024
-ZOOM_SCALE = 0.8
+ZOOM_SCALE = 0.5
 STRIDE = 1024
 MIN_COVERAGE_PCT = 60.0
 OUTPUT_FORMAT = 'png'
@@ -101,6 +96,18 @@ OTSU_MIN_RATIO = 0.01     # 1% minimum tissue in Otsu mask
 BG_THRESHOLD = 15.0       # minimum std in grayscale
 DOWNSAMPLE_FACTOR = 20    # for Otsu mask generation
 
+# Magic number thresholds for generate_otsu_mask()
+OTSU_LARGE_W_THRESHOLD = 20000      # width threshold for large images
+OTSU_LARGE_H_THRESHOLD = 20000      # height threshold for large images
+OTSU_LARGE_CROP_MAX = 8000          # max crop dimension for large images
+OTSU_LARGE_THUMB_MIN = 64           # min thumbnail dimension (large)
+OTSU_LARGE_THUMB_DIVISOR = 100      # crop divisor for large images
+OTSU_MED_W_THRESHOLD = 10000        # width threshold for medium images
+OTSU_MED_H_THRESHOLD = 10000        # height threshold for medium images
+OTSU_MED_CROP_MAX = 5000            # max crop dimension for medium images
+OTSU_MED_THUMB_MIN = 64             # min thumbnail dimension (medium)
+OTSU_MED_THUMB_DIVISOR = 50         # crop divisor for medium images
+
 # ============================================================================
 # Tissue filtering functions (from tiles.py)
 # ============================================================================
@@ -116,19 +123,19 @@ def generate_otsu_mask(img_or_slide: object, downsample_factor: int = 20) -> Tup
             return None, None
         w, h = img_or_slide.size
         try:
-            if w > 20000 or h > 20000:
-                crop_w = min(8000, w)
-                crop_h = min(8000, h)
+            if w > OTSU_LARGE_W_THRESHOLD or h > OTSU_LARGE_H_THRESHOLD:
+                crop_w = min(OTSU_LARGE_CROP_MAX, w)
+                crop_h = min(OTSU_LARGE_CROP_MAX, h)
                 thumb = img_or_slide.crop((0, 0, crop_w, crop_h))
-                thumb.thumbnail((max(64, crop_w // 100), max(64, crop_h // 100)), Image.Resampling.LANCZOS)
-            elif w > 10000 or h > 10000:
-                crop_w = min(5000, w)
-                crop_h = min(5000, h)
+                thumb.thumbnail((max(OTSU_LARGE_THUMB_MIN, crop_w // OTSU_LARGE_THUMB_DIVISOR), max(OTSU_LARGE_THUMB_MIN, crop_h // OTSU_LARGE_THUMB_DIVISOR)), Image.Resampling.LANCZOS)
+            elif w > OTSU_MED_W_THRESHOLD or h > OTSU_MED_H_THRESHOLD:
+                crop_w = min(OTSU_MED_CROP_MAX, w)
+                crop_h = min(OTSU_MED_CROP_MAX, h)
                 thumb = img_or_slide.crop((0, 0, crop_w, crop_h))
-                thumb.thumbnail((max(64, crop_w // 50), max(64, crop_h // 50)), Image.Resampling.LANCZOS)
+                thumb.thumbnail((max(OTSU_MED_THUMB_MIN, crop_w // OTSU_MED_THUMB_DIVISOR), max(OTSU_MED_THUMB_MIN, crop_h // OTSU_MED_THUMB_DIVISOR)), Image.Resampling.LANCZOS)
             else:
-                target_w = max(64, w // downsample_factor)
-                target_h = max(64, h // downsample_factor)
+                target_w = max(OTSU_LARGE_THUMB_MIN, w // downsample_factor)
+                target_h = max(OTSU_LARGE_THUMB_MIN, h // downsample_factor)
                 thumb = img_or_slide.copy()
                 thumb.thumbnail((target_w, target_h), Image.Resampling.LANCZOS)
         except MemoryError:
@@ -246,7 +253,6 @@ def load_slide(tiff_path: str) -> Tuple[object, int, int, str]:
                 logger.error(f"PIL also failed on {tiff_path}: {e2}")
                 raise
 
-    # PIL fallback
     try:
         img = Image.open(tiff_path)
         w, h = img.size
@@ -345,24 +351,6 @@ def get_canonical_class_map() -> Dict[str, int]:
     logger.info(f"Using canonical class map: {CANONICAL_CLASS_MAP}")
     return CANONICAL_CLASS_MAP
 
-def hex_to_rgb(hex_color: str) -> Tuple[int, int, int]:
-    """Convert hex color string (#RRGGBB) to RGB tuple with validation."""
-    # Strip whitespace and remove leading # if present
-    hex_color = hex_color.strip()
-    if hex_color.startswith('#'):
-        hex_color = hex_color[1:]
-
-    # Validate: exactly 6 characters
-    if len(hex_color) != 6:
-        raise ValueError(f"Invalid hex color: {hex_color}. Expected 6 hex digits (e.g., 'ee8718').")
-
-    # Validate: only hex digits (0-9, a-f, A-F)
-    if not all(c in '0123456789abcdefABCDEF' for c in hex_color):
-        raise ValueError(f"Invalid hex color: {hex_color}. Must contain only hex digits (0-9, a-f).")
-
-    # Convert to RGB tuple
-    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
-
 def generate_grayscale_mask(
     class_mask: np.ndarray,
     id_to_gray: Dict[int, int]
@@ -410,17 +398,13 @@ def generate_grid_tiles(
 
     return tiles
 
-def polygon_to_shapely(polygon_coords: List[List[float]]) -> Polygon:
-    """Convert polygon coordinate list to Shapely Polygon."""
-    return Polygon(polygon_coords)
-
 def compute_polygon_centroid(polygon_coords: List[List[float]]) -> Tuple[float, float]:
     """Compute centroid of a polygon."""
     poly = Polygon(polygon_coords)
     centroid = poly.centroid
     return centroid.x, centroid.y
 
-def iter_polygons(geom):
+def iter_polygons(geom: 'shapely.geometry.base.BaseGeometry'):
     """Iterate over Polygon objects from any Shapely geometry (handles MultiPolygon, GeometryCollection, etc.)."""
     if geom.is_empty:
         return
@@ -445,7 +429,6 @@ def rasterize_polygon(
     mask = np.zeros((tile_size, tile_size), dtype=np.uint8)
     x0, y0 = tile_box[0], tile_box[1]
 
-    # Clip polygon to tile bounds with Shapely
     tile_poly = box(tile_box[0], tile_box[1], tile_box[2], tile_box[3])
     glom_poly = Polygon(polygon_coords)
     if not glom_poly.is_valid:
@@ -479,7 +462,7 @@ def compute_coverage(
 ) -> float:
     """Compute percentage of polygon area that overlaps with tile_box."""
     try:
-        polygon = polygon_to_shapely(polygon_coords)
+        polygon = Polygon(polygon_coords)
         if not polygon.is_valid:
             polygon = polygon.buffer(0)
         if polygon.is_empty or polygon.area == 0:
@@ -556,23 +539,6 @@ def update_coverage_for_centered_tile(
     if glom_id in assignment and assignment[glom_id]['primary_is_centered']:
         real_coverage = compute_coverage(glom_coords, tile_box)
         assignment[glom_id]['primary_coverage'] = real_coverage
-
-# ============================================================================
-# Tile I/O
-# ============================================================================
-
-def save_tile_image(image: Image.Image, output_path: str):
-    """Save a tile image as PNG."""
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    image.save(output_path, OUTPUT_FORMAT.upper(), compress_level=COMPRESSION)
-
-def save_tile_mask(mask: np.ndarray, output_path: str):
-    """Save a tile mask as PNG uint8."""
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    mask_img = Image.fromarray(mask, mode='L')
-    mask_img.save(output_path, 'PNG', compress_level=COMPRESSION)
 
 # ============================================================================
 # Slide processing (main work function)
@@ -991,28 +957,30 @@ def dynamic_schedule(
 
     try_submit()
 
-    while active:
-        done, _ = wait(active, return_when=FIRST_COMPLETED)
-        for future in done:
-            pair, mem = active.pop(future)
-            try:
-                result = future.result()
-                results.append(result)
-                logger.info(f"{pair['stem']}: {result['message']}")
-            except Exception as e:
-                logger.error(f"{pair['stem']}: {e}")
-                results.append({
-                    'status': 'error',
-                    'slide_name': pair['stem'],
-                    'message': str(e)
-                })
+    try:
+        while active:
+            done, _ = wait(active, return_when=FIRST_COMPLETED)
+            for future in done:
+                pair, mem = active.pop(future)
+                try:
+                    result = future.result()
+                    results.append(result)
+                    logger.info(f"{pair['stem']}: {result['message']}")
+                except Exception as e:
+                    logger.error(f"{pair['stem']}: {e}")
+                    results.append({
+                        'status': 'error',
+                        'slide_name': pair['stem'],
+                        'message': str(e)
+                    })
 
-            used_ram_gb -= mem
-            logger.info(f"Freed {mem:.1f} GB, now using {used_ram_gb:.1f} GB")
+                used_ram_gb -= mem
+                logger.info(f"Freed {mem:.1f} GB, now using {used_ram_gb:.1f} GB")
 
-        try_submit()
+            try_submit()
+    finally:
+        executor.shutdown(wait=True)
 
-    executor.shutdown(wait=True)
     logger.info(f"All {len(pairs)} slides processed")
     return results
 
